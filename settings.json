@@ -1,0 +1,10 @@
+{
+  "ApiKey": "",
+  "WindowOpacity": 1,
+  "LaunchAtStartup": false,
+  "SystemPrompt": "You are a helpful desktop assistant.",
+  "SelectedModel": "gemini-2.5-flash",
+  "AvailableModels": [
+    "gemini-2.5-flash"
+  ]
+}
