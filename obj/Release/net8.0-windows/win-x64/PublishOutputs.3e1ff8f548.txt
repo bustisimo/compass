@@ -1,2 +1,0 @@
-C:\Users\justi\OneDrive\Desktop\Project\CompassProject\Compass.Client\bin\Release\net8.0-windows\win-x64\publish\Compass.Client.pdb
-C:\Users\justi\OneDrive\Desktop\Project\CompassProject\Compass.Client\bin\Release\net8.0-windows\win-x64\publish\Compass.Client.exe
