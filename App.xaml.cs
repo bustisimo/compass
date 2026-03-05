@@ -2,7 +2,7 @@
 using System.Data;
 using System.Windows;
 
-namespace Compass.Client;
+namespace Compass;
 
 /// <summary>
 /// Interaction logic for App.xaml

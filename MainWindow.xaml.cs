@@ -1,36 +1,37 @@
-﻿﻿using System.Runtime.InteropServices;
+using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using Microsoft.Win32;
-using System.Net.Http;
-using System.Text;
-using System.Text.Json;
-using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
-using System.Windows.Media.Imaging;
-using System.Windows.Shapes;
-using Google.GenAI;
-using Google.GenAI.Types;
+using Compass.Services;
+using Microsoft.Win32;
 
-namespace Compass.Client
+namespace Compass
 {
     public partial class MainWindow : Window
     {
-        // --- API Configuration ---
-        private static readonly List<Content> _chatHistory = new List<Content>();
-        private List<CustomShortcut> _userShortcuts = new List<CustomShortcut>();
-        private AppSettings _appSettings = new AppSettings();
-        private List<AppSearchResult> _appCache = new();
-        private List<AppSearchResult> _shortcutCache = new List<AppSearchResult>();
-        private string _extensionsPath;
-        private List<CompassExtension> _loadedExtensions = new List<CompassExtension>();
+        // --- Services ---
+        private readonly SettingsService _settingsService = new();
+        private readonly GeminiService _geminiService = new();
+        private readonly ExtensionService _extService = new();
+        private readonly AppSearchService _searchService = new();
+
+        // --- State ---
+        private AppSettings _appSettings = new();
+        private List<CustomShortcut> _userShortcuts = new();
+        private List<CompassExtension> _extensions = new();
+        private System.Windows.Forms.NotifyIcon? _notifyIcon;
+        private bool _isExiting;
+
+        // --- Personalization state ---
+        private PersonalizationProposal? _currentPersonalizationProposal;
+        private AppSettings? _settingsBackup;
 
         // --- Native Windows API Constants ---
         private const int HOTKEY_ID = 9000;
@@ -44,33 +45,66 @@ namespace Compass.Client
         // --- P/Invoke Signatures ---
         [DllImport("user32.dll")]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-
         [DllImport("user32.dll")]
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
         private IntPtr _windowHandle;
         private HwndSource? _source;
 
+        // --- Convenience wrappers ---
+        private void SaveSettings() => _settingsService.SaveSettings(_appSettings);
+        private void SaveShortcuts() => _settingsService.SaveShortcuts(_userShortcuts);
+
+        private async Task RefreshExtensionCacheAsync()
+        {
+            _extensions = _extService.LoadExtensions();
+            await _searchService.RefreshCacheAsync(_extensions);
+            BuildTrayMenu();
+        }
+
         public MainWindow()
         {
-            InitializeComponent();
-            _extensionsPath = System.IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData), "Compass", "Extensions");
-            EnsureExtensionsFolderExists();
-            LoadSettings();
-            this.OpacitySlider.Value = _appSettings.WindowOpacity;
-            LoadShortcuts();
-            RefreshAppCache();
-            this.SizeChanged += MainWindow_SizeChanged;
-            this.Deactivated += MainWindow_Deactivated;
-            this.MouseDown += Window_MouseDown;
-            this.IsVisibleChanged += MainWindow_IsVisibleChanged;
+            try
+            {
+                InitializeComponent();
+                _extService.EnsureExtensionsFolderExists();
+                _appSettings = _settingsService.LoadSettings();
+                ApplyPersonalizationSettings();
+                OpacitySlider.Value = _appSettings.WindowOpacity;
+                _userShortcuts = _settingsService.LoadShortcuts();
+                _searchService.RefreshShortcutCache(_userShortcuts);
+                _extensions = _extService.LoadExtensions();
+
+                // Fire-and-forget: scan apps on background thread
+                _ = InitializeCacheAsync();
+
+                this.SizeChanged += MainWindow_SizeChanged;
+                this.Deactivated += MainWindow_Deactivated;
+                this.MouseDown += Window_MouseDown;
+                this.IsVisibleChanged += MainWindow_IsVisibleChanged;
+            }
+            catch (Exception ex)
+            {
+                System.Windows.MessageBox.Show("Initialization failed: " + ex.Message + "\n" + ex.StackTrace, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                Console.Error.WriteLine(ex);
+                throw;
+            }
         }
+
+        private async Task InitializeCacheAsync()
+        {
+            await _searchService.RefreshCacheAsync(_extensions);
+            BuildTrayMenu();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Window lifecycle
+        // ---------------------------------------------------------------------------
 
         private void MainWindow_SizeChanged(object sender, SizeChangedEventArgs e)
         {
             if (e.HeightChanged)
             {
-                // Dynamically recalculate the center of the screen based on the new height
                 this.Top = (SystemParameters.WorkArea.Height - this.ActualHeight) / 2;
                 this.Left = (SystemParameters.WorkArea.Width - this.ActualWidth) / 2;
             }
@@ -79,15 +113,10 @@ namespace Compass.Client
         private void MainWindow_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
         {
             if ((bool)e.NewValue == false && ManagerView.Visibility == Visibility.Visible)
-            {
                 ExitManagerMode();
-            }
         }
 
-        private void MainWindow_Deactivated(object? sender, EventArgs e)
-        {
-            this.Hide();
-        }
+        private void MainWindow_Deactivated(object? sender, EventArgs e) => this.Hide();
 
         private void Window_MouseDown(object sender, MouseButtonEventArgs e)
         {
@@ -95,10 +124,18 @@ namespace Compass.Client
             {
                 var point = e.GetPosition(MainBorder);
                 if (point.X < 0 || point.Y < 0 || point.X > MainBorder.ActualWidth || point.Y > MainBorder.ActualHeight)
-                {
                     this.Hide();
-                }
             }
+        }
+
+        protected override void OnClosing(CancelEventArgs e)
+        {
+            if (!_isExiting)
+            {
+                e.Cancel = true;
+                Hide();
+            }
+            base.OnClosing(e);
         }
 
         protected override void OnPreviewKeyDown(KeyEventArgs e)
@@ -106,17 +143,11 @@ namespace Compass.Client
             if (e.Key == Key.Escape)
             {
                 if (ManagerView.Visibility == Visibility.Visible)
-                {
                     ExitManagerMode();
-                }
                 else if (ExitChatArrow.Visibility == Visibility.Visible)
-                {
                     AnimateToSpotlightMode();
-                }
                 else
-                {
                     this.Hide();
-                }
                 e.Handled = true;
             }
             base.OnPreviewKeyDown(e);
@@ -125,19 +156,14 @@ namespace Compass.Client
         protected override void OnSourceInitialized(EventArgs e)
         {
             base.OnSourceInitialized(e);
-
-            // Get the handle for this window
             _windowHandle = new WindowInteropHelper(this).Handle;
             _source = HwndSource.FromHwnd(_windowHandle);
-            
-            // Add the hook to listen for Windows messages
             _source?.AddHook(WndProc);
 
-            // Register the hotkey: Alt + Space
             if (!RegisterHotKey(_windowHandle, HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE))
-            {
-                MessageBox.Show("Hotkey registration failed. Another app is using this combo.", "Error");
-            }
+                MessageBox.Show("Hotkey registration failed. You might have started Compass already!", "Compass", MessageBoxButton.OK, MessageBoxImage.Warning);
+
+            InitializeTrayIcon();
         }
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -148,12 +174,21 @@ namespace Compass.Client
                 handled = true;
             }
             if (msg == WM_SYSCOMMAND && (wParam.ToInt32() & 0xFFF0) == SC_KEYMENU)
-            {
-                handled = true; // Prevents the Alt+Space System Menu from stealing focus
-            }
-
+                handled = true; // Prevents Alt+Space opening the system menu
             return IntPtr.Zero;
         }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            _source?.RemoveHook(WndProc);
+            UnregisterHotKey(_windowHandle, HOTKEY_ID);
+            _notifyIcon?.Dispose();
+            base.OnClosed(e);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Toggle / Tray
+        // ---------------------------------------------------------------------------
 
         private void ToggleWindow()
         {
@@ -170,7 +205,6 @@ namespace Compass.Client
                 this.Show();
                 this.Activate();
                 Mouse.Capture(null);
-                
                 FocusManager.SetFocusedElement(this, InputBox);
                 Keyboard.Focus(InputBox);
                 InputBox.Focus();
@@ -178,77 +212,65 @@ namespace Compass.Client
             }
         }
 
-        private void SearchResultList_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        private void InitializeTrayIcon()
         {
-            if (sender is ListBoxItem item && item.DataContext is AppSearchResult result)
-            {
-                LaunchApp(result);
-            }
-        }
-
-        private void LaunchApp(AppSearchResult selectedItem)
-        {
-            if (selectedItem.FilePath == "MATH")
-            {
-                Clipboard.SetText(selectedItem.AppName);
-                this.Hide();
-                InputBox.Clear();
-                return;
-            }
-
-            if (selectedItem.FilePath.StartsWith("COMMAND:"))
-            {
-                if (selectedItem.FilePath == "COMMAND:SHORTCUTS") EnterManagerMode("Shortcuts");
-                if (selectedItem.FilePath == "COMMAND:SETTINGS") EnterManagerMode("General");
-                if (selectedItem.FilePath == "COMMAND:COMMANDS") EnterManagerMode("Commands");
-                if (selectedItem.FilePath == "COMMAND:RESUME")
-                {
-                    InputBox.Clear();
-                    AnimateToChatMode();
-                    return;
-                }
-                SearchResultList.Visibility = Visibility.Collapsed;
-                return;
-            }
-            
-            if (selectedItem.FilePath.StartsWith("EXTENSION:"))
-            {
-                string trigger = selectedItem.FilePath.Substring("EXTENSION:".Length);
-                var ext = _loadedExtensions.FirstOrDefault(e => e.TriggerName == trigger);
-                if (ext != null)
-                {
-                    try
-                    {
-                        string script = ext.PowerShellScript.Replace("\"", "\\\"");
-                        ProcessStartInfo psi = new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -Command \"{script}\"");
-                        psi.CreateNoWindow = true; psi.UseShellExecute = false; Process.Start(psi);
-                    }
-                    catch (Exception ex) { AddChatBubble("System", $"Extension Error: {ex.Message}"); }
-                }
-                this.Hide();
-                InputBox.Clear();
-                return;
-            }
-
-            if (selectedItem.FilePath.StartsWith("SHORTCUT:"))
-            {
-                // Auto-fill the shortcut keyword and a space
-                InputBox.Text = selectedItem.AppName + " ";
-                InputBox.CaretIndex = InputBox.Text.Length;
-                InputBox.Focus();
-                return;
-            }
-
+            _notifyIcon = new System.Windows.Forms.NotifyIcon { Text = "Compass" };
             try
             {
-                Process.Start(new ProcessStartInfo { FileName = selectedItem.FilePath, UseShellExecute = true });
+                var mainModule = Process.GetCurrentProcess().MainModule;
+                _notifyIcon.Icon = mainModule != null
+                    ? System.Drawing.Icon.ExtractAssociatedIcon(mainModule.FileName)
+                    : System.Drawing.SystemIcons.Application;
             }
-            catch (Exception ex) { AddChatBubble("System", $"Error: {ex.Message}"); }
-
-            InputBox.Clear();
-            SearchResultList.Visibility = Visibility.Collapsed;
-            this.Hide();
+            catch
+            {
+                _notifyIcon.Icon = System.Drawing.SystemIcons.Application;
+            }
+            _notifyIcon.Visible = true;
+            _notifyIcon.MouseClick += (sender, args) =>
+            {
+                if (args.Button == System.Windows.Forms.MouseButtons.Left) ToggleWindow();
+            };
+            BuildTrayMenu();
         }
+
+        private void BuildTrayMenu()
+        {
+            if (_notifyIcon == null) return;
+
+            var contextMenu = new System.Windows.Forms.ContextMenuStrip();
+            contextMenu.Items.Add("Open Compass", null, (s, e) => ToggleWindow());
+
+            if (_extensions.Any())
+            {
+                contextMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+                var commandsMenu = new System.Windows.Forms.ToolStripMenuItem("Commands");
+                foreach (var ext in _extensions.OrderBy(x => x.TriggerName))
+                {
+                    var capturedExt = ext; // capture for closure
+                    commandsMenu.DropDownItems.Add(ext.TriggerName, null, (s, e) =>
+                    {
+                        try { _extService.ExecuteExtension(capturedExt); }
+                        catch (Exception ex) { Debug.WriteLine($"[Compass] TrayExecuteExtension: {ex.Message}"); }
+                    });
+                }
+                contextMenu.Items.Add(commandsMenu);
+            }
+
+            contextMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            contextMenu.Items.Add("Exit", null, (s, e) =>
+            {
+                _isExiting = true;
+                Application.Current.Shutdown();
+            });
+
+            _notifyIcon.ContextMenuStrip?.Dispose();
+            _notifyIcon.ContextMenuStrip = contextMenu;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Input handling
+        // ---------------------------------------------------------------------------
 
         private async void InputBox_PreviewKeyDown(object sender, KeyEventArgs e)
         {
@@ -297,30 +319,25 @@ namespace Compass.Client
                 string userText = InputBox.Text;
                 if (string.IsNullOrWhiteSpace(userText)) return;
 
-                // Special Command: Edit Shortcuts
-                if (userText.Trim().ToLower() == "shortcuts")
+                if (userText.Trim().Equals("shortcuts", StringComparison.OrdinalIgnoreCase))
                 {
                     EnterManagerMode("Shortcuts");
                     return;
                 }
-                if (userText.Trim().ToLower() == "settings")
+                if (userText.Trim().Equals("settings", StringComparison.OrdinalIgnoreCase))
                 {
                     EnterManagerMode("General");
                     return;
                 }
 
-                // Custom Shortcuts
                 var parts = userText.Split(' ', 2);
                 var shortcut = _userShortcuts.FirstOrDefault(s => s.Keyword.Equals(parts[0], StringComparison.OrdinalIgnoreCase));
                 if (shortcut != null)
                 {
                     string query = parts.Length > 1 ? parts[1] : "";
                     string url = shortcut.UrlTemplate.Replace("{query}", Uri.EscapeDataString(query));
-                    try
-                    {
-                        Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
-                    }
-                    catch { }
+                    try { Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true }); }
+                    catch (Exception ex) { Debug.WriteLine($"[Compass] OpenShortcut: {ex.Message}"); }
                     InputBox.Clear();
                     this.Hide();
                     return;
@@ -328,7 +345,6 @@ namespace Compass.Client
 
                 InputBox.Clear();
                 InputBox.IsEnabled = false;
-
                 AnimateToChatMode();
                 AddChatBubble("You", userText);
 
@@ -355,27 +371,24 @@ namespace Compass.Client
                 return;
             }
 
-            // Math Evaluation
+            // Math evaluation
             try
             {
                 var mathResult = new DataTable().Compute(query, null);
                 if (mathResult != null && !double.IsNaN(Convert.ToDouble(mathResult)))
                 {
-                    var resultItem = new AppSearchResult 
-                    { 
-                        AppName = $"= {mathResult}", 
-                        FilePath = "MATH", 
-                        AppIcon = null 
+                    SearchResultList.ItemsSource = new List<AppSearchResult>
+                    {
+                        new AppSearchResult { AppName = $"= {mathResult}", FilePath = "MATH" }
                     };
-                    SearchResultList.ItemsSource = new List<AppSearchResult> { resultItem };
                     ShowSearchList();
                     SearchResultList.SelectedIndex = 0;
-                    return; // Skip app search if math is valid
+                    return;
                 }
             }
-            catch { }
+            catch { /* not a math expression */ }
 
-            var results = SearchInstalledApps(query);
+            var results = _searchService.Search(query, _geminiService.HasHistory);
             if (results.Any())
             {
                 SearchResultList.ItemsSource = results;
@@ -388,149 +401,77 @@ namespace Compass.Client
             }
         }
 
-        private List<AppSearchResult> SearchInstalledApps(string query)
+        // ---------------------------------------------------------------------------
+        // App launching
+        // ---------------------------------------------------------------------------
+
+        private void SearchResultList_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
-            var candidates = _appCache.Concat(_shortcutCache).ToList();
-
-            if (_chatHistory.Count > 0)
-            {
-                candidates.Add(new AppSearchResult
-                {
-                    AppName = "Resume Chat",
-                    FilePath = "COMMAND:RESUME",
-                    GeometryIcon = Geometry.Parse("M20,2H4A2,2 0 0,0 2,4V22L6,18H20A2,2 0 0,0 22,16V4A2,2 0 0,0 20,2M20,16H6L4,18V4H20")
-                });
-            }
-
-            return candidates
-                .DistinctBy(x => x.AppName)
-                .Select(item => new { Item = item, Score = GetScore(item.AppName, query) })
-                .Where(x => x.Score > 0)
-                .OrderByDescending(x => x.Score)
-                .ThenBy(x => x.Item.AppName)
-                .Take(5)
-                .Select(x => x.Item)
-                .ToList();
+            if (sender is ListBoxItem item && item.DataContext is AppSearchResult result)
+                LaunchApp(result);
         }
 
-        private void RefreshAppCache()
+        private void LaunchApp(AppSearchResult selectedItem)
         {
-            _appCache.Clear();
-
-            // Virtual Results
-            _appCache.Add(new AppSearchResult 
-            { 
-                AppName = "Compass Settings", 
-                FilePath = "COMMAND:SETTINGS", 
-                GeometryIcon = Geometry.Parse("M12,2L4.5,20.29L5.21,21L12,18L18.79,21L19.5,20.29L12,2Z")
-            });
-            _appCache.Add(new AppSearchResult 
-            { 
-                AppName = "Manage Shortcuts", 
-                FilePath = "COMMAND:SHORTCUTS", 
-                GeometryIcon = Geometry.Parse("M4,6H20V8H4V6M4,11H20V13H4V11M4,16H20V18H4V16Z") 
-            });
-            _appCache.Add(new AppSearchResult 
-            { 
-                AppName = "Manage Commands", 
-                FilePath = "COMMAND:COMMANDS", 
-                GeometryIcon = Geometry.Parse("M19,6H5A2,2 0 0,0 3,8V16A2,2 0 0,0 5,18H19A2,2 0 0,0 21,16V8A2,2 0 0,0 19,6M10,15V9L15,12L10,15Z")
-            });
-
-            _appCache.AddRange(LoadExtensions());
-
-            void ScanDir(string dir)
+            if (selectedItem.FilePath == "MATH")
             {
-                try
+                System.Windows.Clipboard.SetText(selectedItem.AppName);
+                this.Hide();
+                InputBox.Clear();
+                return;
+            }
+
+            if (selectedItem.FilePath.StartsWith("COMMAND:"))
+            {
+                if (selectedItem.FilePath == "COMMAND:SHORTCUTS") EnterManagerMode("Shortcuts");
+                if (selectedItem.FilePath == "COMMAND:SETTINGS") EnterManagerMode("General");
+                if (selectedItem.FilePath == "COMMAND:COMMANDS") EnterManagerMode("Commands");
+                if (selectedItem.FilePath == "COMMAND:RESUME")
                 {
-                    if (Directory.Exists(dir))
-                    {
-                        var files = Directory.GetFiles(dir, "*.lnk", SearchOption.AllDirectories);
-                        foreach (var f in files)
-                        {
-                            _appCache.Add(new AppSearchResult { AppName = System.IO.Path.GetFileNameWithoutExtension(f), FilePath = f, AppIcon = GetIcon(f) });
-                        }
-                    }
+                    InputBox.Clear();
+                    AnimateToChatMode();
+                    return;
                 }
-                catch { }
+                SearchResultList.Visibility = Visibility.Collapsed;
+                return;
             }
 
-            ScanDir(System.Environment.GetFolderPath(System.Environment.SpecialFolder.CommonPrograms));
-            ScanDir(System.Environment.GetFolderPath(System.Environment.SpecialFolder.Programs));
-        }
-
-        private void RefreshShortcutCache()
-        {
-            _shortcutCache = _userShortcuts.Select(s => new AppSearchResult
+            if (selectedItem.FilePath.StartsWith("EXTENSION:"))
             {
-                AppName = s.Keyword,
-                FilePath = "SHORTCUT:" + s.Keyword,
-                GeometryIcon = Geometry.Parse("M4,6H20V8H4V6M4,11H20V13H4V11M4,16H20V18H4V16Z")
-            }).ToList();
-        }
-
-        private void EnsureExtensionsFolderExists()
-        {
-            if (!Directory.Exists(_extensionsPath))
-            {
-                Directory.CreateDirectory(_extensionsPath);
-            }
-        }
-
-        private List<AppSearchResult> LoadExtensions()
-        {
-            _loadedExtensions.Clear();
-            var results = new List<AppSearchResult>();
-            if (!Directory.Exists(_extensionsPath)) return results;
-
-            foreach (var file in Directory.GetFiles(_extensionsPath, "*.json"))
-            {
-                try
+                string trigger = selectedItem.FilePath.Substring("EXTENSION:".Length);
+                var ext = _extensions.FirstOrDefault(e => e.TriggerName == trigger);
+                if (ext != null)
                 {
-                    string json = System.IO.File.ReadAllText(file);
-                    var ext = JsonSerializer.Deserialize<CompassExtension>(json);
-                    if (ext != null)
-                    {
-                        _loadedExtensions.Add(ext);
-                        results.Add(new AppSearchResult
-                        {
-                            AppName = ext.TriggerName,
-                            FilePath = $"EXTENSION:{ext.TriggerName}",
-                            GeometryIcon = Geometry.Parse("M19,6H5A2,2 0 0,0 3,8V16A2,2 0 0,0 5,18H19A2,2 0 0,0 21,16V8A2,2 0 0,0 19,6M10,15V9L15,12L10,15Z")
-                        });
-                    }
+                    try { _extService.ExecuteExtension(ext); }
+                    catch (Exception ex) { AddChatBubble("System", $"Extension Error: {ex.Message}"); }
                 }
-                catch { }
+                this.Hide();
+                InputBox.Clear();
+                return;
             }
-            return results;
-        }
 
-        private int GetScore(string text, string query)
-        {
-            if (text.StartsWith(query, StringComparison.OrdinalIgnoreCase)) return 3;
-            if (text.IndexOf(" " + query, StringComparison.OrdinalIgnoreCase) >= 0) return 2;
-            if (text.Contains(query, StringComparison.OrdinalIgnoreCase)) return 1;
-            return 0;
-        }
+            if (selectedItem.FilePath.StartsWith("SHORTCUT:"))
+            {
+                InputBox.Text = selectedItem.AppName + " ";
+                InputBox.CaretIndex = InputBox.Text.Length;
+                InputBox.Focus();
+                return;
+            }
 
-        private System.Windows.Media.ImageSource? GetIcon(string filePath)
-        {
             try
             {
-                using (var icon = System.Drawing.Icon.ExtractAssociatedIcon(filePath))
-                {
-                    if (icon == null) return null;
-                    return Imaging.CreateBitmapSourceFromHIcon(
-                        icon.Handle,
-                        Int32Rect.Empty,
-                        BitmapSizeOptions.FromEmptyOptions());
-                }
+                Process.Start(new ProcessStartInfo { FileName = selectedItem.FilePath, UseShellExecute = true });
             }
-            catch
-            {
-                return null;
-            }
+            catch (Exception ex) { AddChatBubble("System", $"Error: {ex.Message}"); }
+
+            InputBox.Clear();
+            SearchResultList.Visibility = Visibility.Collapsed;
+            this.Hide();
         }
+
+        // ---------------------------------------------------------------------------
+        // Local commands (non-AI)
+        // ---------------------------------------------------------------------------
 
         private async Task<bool> ProcessLocalCommand(string input)
         {
@@ -541,9 +482,7 @@ namespace Compass.Client
                 var parts = input.Split(' ', 3);
                 if (parts.Length == 3)
                 {
-                    string name = parts[1];
-                    string intent = parts[2];
-                    await GenerateExtensionAsync(intent, name);
+                    await GenerateExtensionAsync(parts[2], parts[1]);
                     return true;
                 }
             }
@@ -551,7 +490,7 @@ namespace Compass.Client
             if (lowerInput == "clear" || lowerInput == "clear chat")
             {
                 ChatPanel.Children.Clear();
-                _chatHistory.Clear();
+                _geminiService.ClearHistory();
                 AnimateToSpotlightMode();
                 return true;
             }
@@ -564,15 +503,12 @@ namespace Compass.Client
                     Registry.SetValue(key, "AppsUseLightTheme", 0);
                     Registry.SetValue(key, "SystemUsesLightTheme", 0);
                     AddChatBubble("System", "Switched to Dark Mode.");
-                    return true;
                 }
-                catch (Exception ex)
-                {
-                    AddChatBubble("System", $"Error: {ex.Message}");
-                    return true;
-                }
+                catch (Exception ex) { AddChatBubble("System", $"Error: {ex.Message}"); }
+                return true;
             }
-            else if (lowerInput == "light mode")
+
+            if (lowerInput == "light mode")
             {
                 try
                 {
@@ -580,13 +516,9 @@ namespace Compass.Client
                     Registry.SetValue(key, "AppsUseLightTheme", 1);
                     Registry.SetValue(key, "SystemUsesLightTheme", 1);
                     AddChatBubble("System", "Switched to Light Mode.");
-                    return true;
                 }
-                catch (Exception ex)
-                {
-                    AddChatBubble("System", $"Error: {ex.Message}");
-                    return true;
-                }
+                catch (Exception ex) { AddChatBubble("System", $"Error: {ex.Message}"); }
+                return true;
             }
 
             if (lowerInput == "lock screen")
@@ -595,57 +527,29 @@ namespace Compass.Client
                 {
                     Process.Start("rundll32.exe", "user32.dll,LockWorkStation");
                     AddChatBubble("System", "Locking screen...");
-                    return true;
                 }
-                catch (Exception ex)
-                {
-                    AddChatBubble("System", $"Error: {ex.Message}");
-                    return true;
-                }
+                catch (Exception ex) { AddChatBubble("System", $"Error: {ex.Message}"); }
+                return true;
             }
 
             return false;
         }
 
+        // ---------------------------------------------------------------------------
+        // Gemini / AI
+        // ---------------------------------------------------------------------------
+
         private async Task AskGeminiAsync(string prompt)
         {
             try
             {
-                // Add the user's message to the history
-                _chatHistory.Add(new Content
+                if (string.IsNullOrWhiteSpace(_appSettings.ApiKey))
                 {
-                    Role = "user",
-                    Parts = new List<Part> { new Part { Text = prompt } }
-                });
-
-                // Initialize the official client
-                var client = new Google.GenAI.Client(apiKey: _appSettings.ApiKey);
-                
-                // Pass your custom system instructions
-                var config = new GenerateContentConfig
-                {
-                    SystemInstruction = new Content { Parts = new List<Part> { new Part { Text = _appSettings.SystemPrompt } } }
-                };
-
-                // Call the API using your full chat history context
-                var response = await client.Models.GenerateContentAsync(
-                    model: _appSettings.SelectedModel,
-                    contents: _chatHistory,
-                    config: config
-                );
-
-                string? text = response.Candidates?[0].Content?.Parts?[0].Text;
-
-                if (text != null)
-                {
-                    _chatHistory.Add(new Content
-                    {
-                        Role = "model",
-                        Parts = new List<Part> { new Part { Text = text } }
-                    });
+                    AddChatBubble("System", "API key is not set. Please enter a valid Gemini API key in settings.");
+                    return;
                 }
-                
-                AddChatBubble("Gemini", text ?? "...");
+                string response = await _geminiService.AskAsync(prompt, _appSettings);
+                AddChatBubble("Gemini", response);
             }
             catch (Exception ex)
             {
@@ -663,30 +567,19 @@ namespace Compass.Client
             try
             {
                 AddChatBubble("System", $"Generating command '{name}'...");
-                
-                var client = new Google.GenAI.Client(apiKey: _appSettings.ApiKey);
-                
-                var config = new GenerateContentConfig
+
+                if (string.IsNullOrWhiteSpace(_appSettings.ApiKey))
                 {
-                    SystemInstruction = new Content { Parts = new List<Part> { new Part { Text = "You are a Windows automation expert. The user wants to: " + intent + ". Write a safe, functional PowerShell script to do this. Return ONLY the raw script text. No markdown formatting, no backticks, no explanations." } } }
-                };
+                    AddChatBubble("System", "API key is not set. Please enter a valid Gemini API key in settings.");
+                    return;
+                }
 
-                var response = await client.Models.GenerateContentAsync(
-                    model: _appSettings.SelectedModel,
-                    contents: intent, // Single prompt, no history needed
-                    config: config
-                );
-
-                string? script = response.Candidates?[0].Content?.Parts?[0].Text;
-
+                string? script = await _geminiService.GeneratePowerShellScriptAsync(intent, _appSettings);
                 if (script != null)
                 {
-                    script = script.Replace("```powershell", "").Replace("```", "").Trim();
                     var ext = new CompassExtension { TriggerName = name, Description = intent, PowerShellScript = script };
-                    string extJson = JsonSerializer.Serialize(ext, new JsonSerializerOptions { WriteIndented = true });
-                    System.IO.File.WriteAllText(System.IO.Path.Combine(_extensionsPath, $"{name}.json"), extJson);
-                    
-                    RefreshAppCache();
+                    _extService.SaveExtension(ext);
+                    await RefreshExtensionCacheAsync();
                     AddChatBubble("System", $"Command '{name}' created successfully.");
                 }
             }
@@ -695,6 +588,10 @@ namespace Compass.Client
                 AddChatBubble("System", $"Failed to generate extension: {ex.Message}");
             }
         }
+
+        // ---------------------------------------------------------------------------
+        // Chat UI
+        // ---------------------------------------------------------------------------
 
         private void AddChatBubble(string sender, string text)
         {
@@ -708,13 +605,13 @@ namespace Compass.Client
 
             if (sender == "You")
             {
-                border.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#1E1E1E"));
+                border.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1E1E1E"));
                 border.HorizontalAlignment = HorizontalAlignment.Right;
             }
             else
             {
-                border.Background = System.Windows.Media.Brushes.Transparent;
-                border.BorderBrush = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#2A2A2A"));
+                border.Background = Brushes.Transparent;
+                border.BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2A2A2A"));
                 border.BorderThickness = new Thickness(1);
                 border.HorizontalAlignment = HorizontalAlignment.Left;
             }
@@ -723,13 +620,13 @@ namespace Compass.Client
             {
                 Text = text,
                 TextWrapping = TextWrapping.Wrap,
-                FontFamily = new System.Windows.Media.FontFamily("Segoe UI Variable Text"),
+                FontFamily = new FontFamily("Segoe UI Variable Text"),
                 FontSize = 14,
-                Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#E0E0E0")),
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#E0E0E0")),
                 Margin = new Thickness(5),
                 IsReadOnly = true,
                 BorderThickness = new Thickness(0),
-                Background = System.Windows.Media.Brushes.Transparent,
+                Background = Brushes.Transparent,
                 Cursor = Cursors.IBeam
             };
 
@@ -745,7 +642,7 @@ namespace Compass.Client
             ClearChatBtn.Visibility = Visibility.Visible;
             ChatScroll.Visibility = Visibility.Visible;
             ChatScroll.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromSeconds(0.2)));
-            
+
             var scaleAnim = new DoubleAnimation(1, TimeSpan.FromSeconds(0.3))
             {
                 EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }
@@ -759,12 +656,12 @@ namespace Compass.Client
             HideSearchList();
             ExitChatArrow.Visibility = Visibility.Collapsed;
             ClearChatBtn.Visibility = Visibility.Collapsed;
-            
+
             var scaleAnim = new DoubleAnimation(0, TimeSpan.FromSeconds(0.3))
             {
                 EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn }
             };
-            scaleAnim.Completed += (s, e) => 
+            scaleAnim.Completed += (s, e) =>
             {
                 ChatScroll.Visibility = Visibility.Collapsed;
                 UpdateResumeIndicator();
@@ -779,8 +676,7 @@ namespace Compass.Client
                 ResumeChatIndicator.Visibility = Visibility.Collapsed;
                 return;
             }
-
-            bool hasHistory = _chatHistory.Count > 0;
+            bool hasHistory = _geminiService.HasHistory;
             bool isEmpty = string.IsNullOrEmpty(InputBox.Text);
             ResumeChatIndicator.Visibility = (hasHistory && isEmpty) ? Visibility.Visible : Visibility.Collapsed;
         }
@@ -791,14 +687,11 @@ namespace Compass.Client
             AnimateToChatMode();
         }
 
-        private void ResumeChat_Click(object sender, MouseButtonEventArgs e)
-        {
-            ResumeChat();
-        }
+        private void ResumeChat_Click(object sender, MouseButtonEventArgs e) => ResumeChat();
 
         private void ClearChatBtn_Click(object sender, MouseButtonEventArgs e)
         {
-            _chatHistory.Clear();
+            _geminiService.ClearHistory();
             ChatPanel.Children.Clear();
             AddChatBubble("System", "Chat history cleared.");
             UpdateResumeIndicator();
@@ -809,6 +702,10 @@ namespace Compass.Client
             AnimateToSpotlightMode();
             ExitChatArrow.Visibility = Visibility.Collapsed;
         }
+
+        // ---------------------------------------------------------------------------
+        // Search list animations
+        // ---------------------------------------------------------------------------
 
         private void ShowSearchList()
         {
@@ -832,53 +729,42 @@ namespace Compass.Client
             SearchScale.BeginAnimation(ScaleTransform.ScaleYProperty, anim);
         }
 
-        protected override void OnClosed(EventArgs e)
+        // Scroll bar hover handlers
+        private void ScrollBar_MouseEnter(object sender, MouseEventArgs e)
         {
-            // Clean up the hotkey registration to prevent memory leaks or system conflicts
-            _source?.RemoveHook(WndProc);
-            UnregisterHotKey(_windowHandle, HOTKEY_ID);
-            base.OnClosed(e);
-        }
-
-        private void LoadShortcuts()
-        {
-            const string fileName = "shortcuts.json";
-            if (System.IO.File.Exists(fileName))
+            if (sender is Grid grid)
             {
-                try
-                {
-                    string json = System.IO.File.ReadAllText(fileName);
-                    _userShortcuts = JsonSerializer.Deserialize<List<CustomShortcut>>(json) ?? new List<CustomShortcut>();
-                    RefreshShortcutCache();
-                }
-                catch { }
-            }
-            else
-            {
-                _userShortcuts = new List<CustomShortcut>
-                {
-                    new CustomShortcut { Keyword = "google", UrlTemplate = "https://www.google.com/search?q={query}" },
-                    new CustomShortcut { Keyword = "yt", UrlTemplate = "https://www.youtube.com/results?search_query={query}" }
-                };
-                try
-                {
-                    string json = JsonSerializer.Serialize(_userShortcuts, new JsonSerializerOptions { WriteIndented = true });
-                    System.IO.File.WriteAllText(fileName, json);
-                    RefreshShortcutCache();
-                }
-                catch { }
+                var thumb = FindVisualChild<Thumb>(grid);
+                if (thumb != null) thumb.Opacity = 1;
             }
         }
 
-        private void SaveShortcuts()
+        private void ScrollBar_MouseLeave(object sender, MouseEventArgs e)
         {
-            try
+            if (sender is Grid grid)
             {
-                string json = JsonSerializer.Serialize(_userShortcuts, new JsonSerializerOptions { WriteIndented = true });
-                System.IO.File.WriteAllText("shortcuts.json", json);
+                var thumb = FindVisualChild<Thumb>(grid);
+                if (thumb != null) thumb.Opacity = 0;
             }
-            catch { }
         }
+
+        private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+        {
+            if (parent == null) return null;
+            int count = VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < count; i++)
+            {
+                var child = VisualTreeHelper.GetChild(parent, i);
+                if (child is T t) return t;
+                var result = FindVisualChild<T>(child);
+                if (result != null) return result;
+            }
+            return null;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Manager mode
+        // ---------------------------------------------------------------------------
 
         private void EnterManagerMode(string tabName = "General")
         {
@@ -886,15 +772,14 @@ namespace Compass.Client
             ManagerView.Visibility = Visibility.Visible;
             ShortcutsList.ItemsSource = null;
             ShortcutsList.ItemsSource = _userShortcuts;
-            
             CommandsList.ItemsSource = null;
-            CommandsList.ItemsSource = _loadedExtensions;
-            
+            CommandsList.ItemsSource = _extensions;
             ApiKeyBox.Password = _appSettings.ApiKey;
             StartupCheck.IsChecked = _appSettings.LaunchAtStartup;
             OpacitySlider.Value = _appSettings.WindowOpacity;
             SystemPromptBox.Text = _appSettings.SystemPrompt;
             RefreshModelList();
+            _ = FetchAvailableModelsAsync();
 
             foreach (TabItem tab in SettingsTabs.Items)
             {
@@ -903,51 +788,6 @@ namespace Compass.Client
                     SettingsTabs.SelectedItem = tab;
                     break;
                 }
-            }
-        }
-
-        private void RefreshModelList()
-        {
-            ModelComboBox.ItemsSource = null;
-            ModelComboBox.ItemsSource = _appSettings.AvailableModels;
-            ModelComboBox.SelectedItem = _appSettings.SelectedModel;
-
-            ModelsList.ItemsSource = null;
-            ModelsList.ItemsSource = _appSettings.AvailableModels;
-        }
-
-        private void ModelComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (ModelComboBox.SelectedItem is string model)
-            {
-                _appSettings.SelectedModel = model;
-                SaveSettings();
-            }
-        }
-
-        private void AddModel_Click(object sender, RoutedEventArgs e)
-        {
-            string newModel = NewModelBox.Text.Trim();
-            if (!string.IsNullOrWhiteSpace(newModel) && !_appSettings.AvailableModels.Contains(newModel))
-            {
-                _appSettings.AvailableModels.Add(newModel);
-                RefreshModelList();
-                NewModelBox.Clear();
-                SaveSettings();
-            }
-        }
-
-        private void DeleteModel_Click(object sender, RoutedEventArgs e)
-        {
-            if (sender is Button btn && btn.DataContext is string model)
-            {
-                _appSettings.AvailableModels.Remove(model);
-                if (_appSettings.SelectedModel == model)
-                {
-                    _appSettings.SelectedModel = _appSettings.AvailableModels.FirstOrDefault() ?? "gemini-2.0-flash";
-                }
-                RefreshModelList();
-                SaveSettings();
             }
         }
 
@@ -962,6 +802,37 @@ namespace Compass.Client
 
         private void ExitManagerMode_Click(object sender, RoutedEventArgs e) => ExitManagerMode();
 
+        private void RefreshModelList()
+        {
+            ModelComboBox.ItemsSource = null;
+            ModelComboBox.ItemsSource = _appSettings.AvailableModels;
+            ModelComboBox.SelectedItem = _appSettings.SelectedModel;
+        }
+
+        private async Task FetchAvailableModelsAsync()
+        {
+            var models = await _geminiService.FetchAvailableModelsAsync(_appSettings);
+            if (models.Count > 0)
+            {
+                _appSettings.AvailableModels = models;
+                RefreshModelList();
+                SaveSettings();
+            }
+        }
+
+        private void ModelComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (ModelComboBox.SelectedItem is string model)
+            {
+                _appSettings.SelectedModel = model;
+                SaveSettings();
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // Shortcut management
+        // ---------------------------------------------------------------------------
+
         private void AddShortcut_Click(object sender, RoutedEventArgs e)
         {
             if (!string.IsNullOrWhiteSpace(NewKeywordBox.Text) && !string.IsNullOrWhiteSpace(NewUrlBox.Text))
@@ -971,7 +842,7 @@ namespace Compass.Client
                 NewUrlBox.Clear();
                 ShortcutsList.ItemsSource = null;
                 ShortcutsList.ItemsSource = _userShortcuts;
-                RefreshShortcutCache();
+                _searchService.RefreshShortcutCache(_userShortcuts);
                 SaveShortcuts();
             }
         }
@@ -983,61 +854,62 @@ namespace Compass.Client
                 _userShortcuts.Remove(shortcut);
                 ShortcutsList.ItemsSource = null;
                 ShortcutsList.ItemsSource = _userShortcuts;
-                RefreshShortcutCache();
+                _searchService.RefreshShortcutCache(_userShortcuts);
                 SaveShortcuts();
             }
         }
+
+        // ---------------------------------------------------------------------------
+        // Command (Extension) management
+        // ---------------------------------------------------------------------------
 
         private async void CreateCommand_Click(object sender, RoutedEventArgs e)
         {
             string name = NewCommandTrigger.Text.Trim();
             string intent = NewCommandIntent.Text.Trim();
+            var btn = (Button)sender;
 
             if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(intent))
             {
-                MessageBox.Show("Please enter a trigger name and description.");
+                var original = btn.Content;
+                btn.Content = "Missing Info!";
+                btn.IsEnabled = false;
+                await Task.Delay(2000);
+                btn.Content = original;
+                btn.IsEnabled = true;
                 return;
             }
 
-            var btn = (Button)sender;
             btn.IsEnabled = false;
             btn.Content = "Generating...";
 
             try
             {
-                var client = new Google.GenAI.Client(apiKey: _appSettings.ApiKey);
-                var config = new GenerateContentConfig
+                if (string.IsNullOrWhiteSpace(_appSettings.ApiKey))
                 {
-                    SystemInstruction = new Content { Parts = new List<Part> { new Part { Text = "You are a Windows automation expert. The user wants to: " + intent + ". Write a safe, functional PowerShell script to do this. Return ONLY the raw script text. No markdown formatting, no backticks, no explanations." } } }
-                };
+                    MessageBox.Show("Please configure your API Key in the General settings first.", "API Key Required", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
 
-                var response = await client.Models.GenerateContentAsync(
-                    model: _appSettings.SelectedModel,
-                    contents: intent,
-                    config: config
-                );
-
-                string? script = response.Candidates?[0].Content?.Parts?[0].Text;
-
+                string? script = await _geminiService.GeneratePowerShellScriptAsync(intent, _appSettings);
                 if (script != null)
                 {
-                    script = script.Replace("```powershell", "").Replace("```", "").Trim();
                     var ext = new CompassExtension { TriggerName = name, Description = intent, PowerShellScript = script };
-                    string extJson = JsonSerializer.Serialize(ext, new JsonSerializerOptions { WriteIndented = true });
-                    System.IO.File.WriteAllText(System.IO.Path.Combine(_extensionsPath, $"{name}.json"), extJson);
-                    
-                    RefreshAppCache();
+                    _extService.SaveExtension(ext);
+                    await RefreshExtensionCacheAsync();
                     CommandsList.ItemsSource = null;
-                    CommandsList.ItemsSource = _loadedExtensions;
-                    
+                    CommandsList.ItemsSource = _extensions;
                     NewCommandTrigger.Clear();
                     NewCommandIntent.Clear();
-                    MessageBox.Show($"Command '{name}' created successfully!");
+                    btn.Content = "Created!";
+                    await Task.Delay(2000);
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Failed to generate command: {ex.Message}");
+                btn.Content = "Error!";
+                Debug.WriteLine($"[Compass] CreateCommand: {ex.Message}");
+                MessageBox.Show($"Failed to generate command: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
             finally
             {
@@ -1046,59 +918,36 @@ namespace Compass.Client
             }
         }
 
-        private void DeleteCommand_Click(object sender, RoutedEventArgs e)
+        private async void DeleteCommand_Click(object sender, RoutedEventArgs e)
         {
             if (sender is Button btn && btn.DataContext is CompassExtension ext)
             {
-                try
-                {
-                    string path = System.IO.Path.Combine(_extensionsPath, $"{ext.TriggerName}.json");
-                    if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
-                    
-                    RefreshAppCache();
-                    CommandsList.ItemsSource = null;
-                    CommandsList.ItemsSource = _loadedExtensions;
-                }
-                catch (Exception ex) { MessageBox.Show("Error deleting command: " + ex.Message); }
+                _extService.DeleteExtension(ext.TriggerName);
+                await RefreshExtensionCacheAsync();
+                CommandsList.ItemsSource = null;
+                CommandsList.ItemsSource = _extensions;
             }
         }
 
-        private void LoadSettings()
-        {
-            const string fileName = "settings.json";
-            if (System.IO.File.Exists(fileName))
-            {
-                try
-                {
-                    string json = System.IO.File.ReadAllText(fileName);
-                    _appSettings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
-                    if (_appSettings.AvailableModels == null || !_appSettings.AvailableModels.Any())
-                    {
-                        _appSettings.AvailableModels = new List<string> { "gemini-2.0-flash", "gemini-1.5-pro" };
-                    }
-                }
-                catch { }
-            }
+        // ---------------------------------------------------------------------------
+        // Settings UI
+        // ---------------------------------------------------------------------------
 
-            MainBorder.Opacity = _appSettings.WindowOpacity;
-        }
-
-        private void SaveSettings()
-        {
-            try
-            {
-                string json = JsonSerializer.Serialize(_appSettings, new JsonSerializerOptions { WriteIndented = true });
-                System.IO.File.WriteAllText("settings.json", json);
-            }
-            catch { }
-        }
-
-        private void SaveApiKey_Click(object sender, RoutedEventArgs e)
+        private async void SaveApiKey_Click(object sender, RoutedEventArgs e)
         {
             _appSettings.ApiKey = ApiKeyBox.Password;
             _appSettings.SystemPrompt = SystemPromptBox.Text;
             SaveSettings();
-            MessageBox.Show("Settings saved.", "Compass");
+
+            if (sender is Button btn)
+            {
+                var originalContent = btn.Content;
+                btn.Content = "Saved!";
+                btn.IsEnabled = false;
+                await Task.Delay(2000);
+                btn.Content = originalContent;
+                btn.IsEnabled = true;
+            }
         }
 
         private void StartupCheck_Changed(object sender, RoutedEventArgs e)
@@ -1111,15 +960,14 @@ namespace Compass.Client
                 string runKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
                 using RegistryKey? key = Registry.CurrentUser.OpenSubKey(runKey, true);
                 if (_appSettings.LaunchAtStartup)
-                {
-                    key?.SetValue("Compass", System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "");
-                }
+                    key?.SetValue("Compass", Process.GetCurrentProcess().MainModule?.FileName ?? "");
                 else
-                {
                     key?.DeleteValue("Compass", false);
-                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Compass] StartupRegistry: {ex.Message}");
+            }
         }
 
         private void OpacitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -1129,36 +977,257 @@ namespace Compass.Client
             MainBorder.Opacity = _appSettings.WindowOpacity;
             SaveSettings();
         }
-    }
 
-    public class AppSearchResult
-    {
-        public string AppName { get; set; } = string.Empty;
-        public string FilePath { get; set; } = string.Empty;
-        public System.Windows.Media.ImageSource? AppIcon { get; set; }
-        public System.Windows.Media.Geometry? GeometryIcon { get; set; }
-    }
+        // ---------------------------------------------------------------------------
+        // Personalization
+        // ---------------------------------------------------------------------------
 
-    public class CustomShortcut
-    {
-        public string Keyword { get; set; } = string.Empty;
-        public string UrlTemplate { get; set; } = string.Empty;
-    }
+        private void ApplyPersonalizationSettings()
+        {
+            try
+            {
+                MainBorder.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString(_appSettings.PrimaryColor));
+                MainBorder.BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(_appSettings.BorderColor));
+                MainBorder.CornerRadius = new CornerRadius(_appSettings.BorderRadius);
 
-    public class AppSettings
-    {
-        public string ApiKey { get; set; } = "";
-        public double WindowOpacity { get; set; } = 1.0;
-        public bool LaunchAtStartup { get; set; } = false;
-        public string SystemPrompt { get; set; } = "You are a helpful desktop assistant.";
-        public string SelectedModel { get; set; } = "gemini-2.0-flash";
-        public List<string> AvailableModels { get; set; } = new List<string> { "gemini-2.0-flash", "gemini-1.5-pro" };
-    }
+                if (_appSettings.WindowWidth > 0) this.Width = _appSettings.WindowWidth;
 
-    public class CompassExtension
-    {
-        public string TriggerName { get; set; } = string.Empty;
-        public string Description { get; set; } = string.Empty;
-        public string PowerShellScript { get; set; } = string.Empty;
+                if (_appSettings.WindowHeight > 0)
+                {
+                    this.SizeToContent = SizeToContent.Manual;
+                    this.Height = _appSettings.WindowHeight;
+                }
+                else
+                {
+                    this.SizeToContent = SizeToContent.Height;
+                }
+
+                this.FontFamily = new FontFamily(_appSettings.FontFamily);
+                this.FontSize = _appSettings.FontSize;
+                PlaceholderText.Text = _appSettings.CompassBoxDefaultText;
+                UpdateCurrentPersonalizationDisplay();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Compass] ApplyPersonalization: {ex.Message}");
+            }
+        }
+
+        private void UpdateCurrentPersonalizationDisplay()
+        {
+            var display = $@"Default Text: ""{_appSettings.CompassBoxDefaultText}""
+Primary Color: {_appSettings.PrimaryColor}
+Accent Color: {_appSettings.AccentColor}
+Window Width: {_appSettings.WindowWidth}
+Window Height: {(_appSettings.WindowHeight > 0 ? _appSettings.WindowHeight.ToString() : "Auto")}
+Font Family: {_appSettings.FontFamily}
+Font Size: {_appSettings.FontSize}
+Animations Enabled: {_appSettings.AnimationsEnabled}
+Border Color: {_appSettings.BorderColor}
+Border Radius: {_appSettings.BorderRadius}";
+            CurrentPersonalizationSettings.Text = display;
+        }
+
+        private void BackupCurrentSettings()
+        {
+            if (_settingsBackup != null) return; // Don't overwrite a backup with temporary state
+            _settingsBackup = new AppSettings
+            {
+                CompassBoxDefaultText = _appSettings.CompassBoxDefaultText,
+                PrimaryColor = _appSettings.PrimaryColor,
+                AccentColor = _appSettings.AccentColor,
+                WindowWidth = _appSettings.WindowWidth,
+                WindowHeight = _appSettings.WindowHeight,
+                FontFamily = _appSettings.FontFamily,
+                FontSize = _appSettings.FontSize,
+                AnimationsEnabled = _appSettings.AnimationsEnabled,
+                BorderColor = _appSettings.BorderColor,
+                BorderRadius = _appSettings.BorderRadius
+            };
+        }
+
+        private void RestoreSettingsBackup()
+        {
+            if (_settingsBackup == null) return;
+            _appSettings.CompassBoxDefaultText = _settingsBackup.CompassBoxDefaultText;
+            _appSettings.PrimaryColor = _settingsBackup.PrimaryColor;
+            _appSettings.AccentColor = _settingsBackup.AccentColor;
+            _appSettings.WindowWidth = _settingsBackup.WindowWidth;
+            _appSettings.WindowHeight = _settingsBackup.WindowHeight;
+            _appSettings.FontFamily = _settingsBackup.FontFamily;
+            _appSettings.FontSize = _settingsBackup.FontSize;
+            _appSettings.AnimationsEnabled = _settingsBackup.AnimationsEnabled;
+            _appSettings.BorderColor = _settingsBackup.BorderColor;
+            _appSettings.BorderRadius = _settingsBackup.BorderRadius;
+            _settingsBackup = null;
+            ApplyPersonalizationSettings();
+        }
+
+        private void QuickStyle_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button btn && btn.Tag is string styleDescription)
+                PersonalizationInputBox.Text = styleDescription;
+        }
+
+        private void ResetPersonalization_Click(object sender, RoutedEventArgs e)
+        {
+            if (MessageBox.Show("Are you sure you want to reset Compass to default appearance?", "Reset Defaults", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+            {
+                var defaults = new AppSettings();
+                _appSettings.CompassBoxDefaultText = defaults.CompassBoxDefaultText;
+                _appSettings.PrimaryColor = defaults.PrimaryColor;
+                _appSettings.AccentColor = defaults.AccentColor;
+                _appSettings.WindowWidth = defaults.WindowWidth;
+                _appSettings.WindowHeight = defaults.WindowHeight;
+                _appSettings.FontFamily = defaults.FontFamily;
+                _appSettings.FontSize = defaults.FontSize;
+                _appSettings.AnimationsEnabled = defaults.AnimationsEnabled;
+                _appSettings.BorderColor = defaults.BorderColor;
+                _appSettings.BorderRadius = defaults.BorderRadius;
+                _settingsBackup = null;
+                PreviewSection.Visibility = Visibility.Collapsed;
+                _currentPersonalizationProposal = null;
+                PersonalizationInputBox.Clear();
+                SaveSettings();
+                ApplyPersonalizationSettings();
+                MessageBox.Show("Compass appearance has been reset to defaults.", "Reset Complete", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+
+        private async void GeneratePersonalizationPreview_Click(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(PersonalizationInputBox.Text))
+            {
+                MessageBox.Show("Please describe how you want Compass to look.", "Input Required", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(_appSettings.ApiKey))
+            {
+                MessageBox.Show("Please configure your API Key in the General settings first.", "API Key Required", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var btn = sender as Button;
+            if (btn != null) { btn.IsEnabled = false; btn.Content = "Generating..."; }
+
+            try
+            {
+                string systemPrompt = PersonalizationManager.GetPersonalizationSystemPrompt();
+                string userRequest = PersonalizationInputBox.Text;
+
+                // Use a fresh single-turn request (not chat history)
+                var tempSettings = new AppSettings
+                {
+                    ApiKey = _appSettings.ApiKey,
+                    SelectedModel = _appSettings.SelectedModel,
+                    SystemPrompt = systemPrompt
+                };
+                var singleTurnService = new GeminiService();
+
+                string jsonText = await singleTurnService.AskAsync(userRequest, tempSettings);
+
+                // Strip markdown fences if present
+                if (jsonText.Contains("```"))
+                {
+                    int start = jsonText.IndexOf("{");
+                    int end = jsonText.LastIndexOf("}");
+                    if (start >= 0 && end >= 0)
+                        jsonText = jsonText.Substring(start, end - start + 1);
+                }
+
+                _currentPersonalizationProposal = PersonalizationManager.ParseResponse(jsonText);
+
+                if (_currentPersonalizationProposal == null ||
+                    (string.IsNullOrEmpty(_currentPersonalizationProposal.CompassBoxDefaultText) &&
+                     string.IsNullOrEmpty(_currentPersonalizationProposal.PrimaryColor) &&
+                     string.IsNullOrEmpty(_currentPersonalizationProposal.AccentColor) &&
+                     _currentPersonalizationProposal.WindowWidth == null &&
+                     _currentPersonalizationProposal.FontFamily == null))
+                {
+                    MessageBox.Show("Could not understand your request. Please describe visual changes more clearly.", "Invalid Request", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                BackupCurrentSettings();
+                ApplyProposalTemporarily(_currentPersonalizationProposal);
+                ShowPersonalizationPreview(_currentPersonalizationProposal);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error generating preview: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                if (btn != null) { btn.IsEnabled = true; btn.Content = "Generate & Preview"; }
+            }
+        }
+
+        private void ApplyProposalTemporarily(PersonalizationProposal proposal)
+        {
+            if (!string.IsNullOrEmpty(proposal.CompassBoxDefaultText))
+                _appSettings.CompassBoxDefaultText = proposal.CompassBoxDefaultText;
+            if (!string.IsNullOrEmpty(proposal.PrimaryColor))
+                _appSettings.PrimaryColor = proposal.PrimaryColor;
+            if (!string.IsNullOrEmpty(proposal.AccentColor))
+                _appSettings.AccentColor = proposal.AccentColor;
+            if (proposal.WindowWidth.HasValue && proposal.WindowWidth > 0)
+                _appSettings.WindowWidth = proposal.WindowWidth.Value;
+            if (proposal.WindowHeight.HasValue && proposal.WindowHeight > 0)
+                _appSettings.WindowHeight = proposal.WindowHeight.Value;
+            if (!string.IsNullOrEmpty(proposal.FontFamily))
+                _appSettings.FontFamily = proposal.FontFamily;
+            if (proposal.FontSize.HasValue && proposal.FontSize > 0)
+                _appSettings.FontSize = proposal.FontSize.Value;
+            if (proposal.AnimationsEnabled.HasValue)
+                _appSettings.AnimationsEnabled = proposal.AnimationsEnabled.Value;
+            if (!string.IsNullOrEmpty(proposal.BorderColor))
+                _appSettings.BorderColor = proposal.BorderColor;
+            if (proposal.BorderRadius.HasValue && proposal.BorderRadius >= 0)
+                _appSettings.BorderRadius = proposal.BorderRadius.Value;
+            ApplyPersonalizationSettings();
+        }
+
+        private void ShowPersonalizationPreview(PersonalizationProposal proposal)
+        {
+            var changesList = new List<string>();
+            if (!string.IsNullOrEmpty(proposal.CompassBoxDefaultText))
+                changesList.Add($"• Default text: \"{proposal.CompassBoxDefaultText}\"");
+            if (!string.IsNullOrEmpty(proposal.PrimaryColor))
+                changesList.Add($"• Primary color: {proposal.PrimaryColor}");
+            if (!string.IsNullOrEmpty(proposal.AccentColor))
+                changesList.Add($"• Accent color: {proposal.AccentColor}");
+            if (proposal.WindowWidth.HasValue)
+                changesList.Add($"• Window width: {proposal.WindowWidth}");
+            if (!string.IsNullOrEmpty(proposal.FontFamily))
+                changesList.Add($"• Font: {proposal.FontFamily}");
+            if (proposal.FontSize.HasValue)
+                changesList.Add($"• Font size: {proposal.FontSize}");
+            if (proposal.AnimationsEnabled.HasValue)
+                changesList.Add($"• Animations: {(proposal.AnimationsEnabled.Value ? "Enabled" : "Disabled")}");
+            if (!string.IsNullOrEmpty(proposal.BorderColor))
+                changesList.Add($"• Border color: {proposal.BorderColor}");
+            if (proposal.BorderRadius.HasValue)
+                changesList.Add($"• Corner radius: {proposal.BorderRadius}");
+            PreviewChangesText.Text = string.Join("\n", changesList);
+            PreviewSection.Visibility = Visibility.Visible;
+        }
+
+        private void AcceptPersonalization_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentPersonalizationProposal == null) return;
+            SaveSettings();
+            _settingsBackup = null;
+            PreviewSection.Visibility = Visibility.Collapsed;
+            PersonalizationInputBox.Clear();
+            _currentPersonalizationProposal = null;
+            MessageBox.Show("Personalization changes applied successfully!", "Success", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        private void RejectPersonalization_Click(object sender, RoutedEventArgs e)
+        {
+            RestoreSettingsBackup();
+            PreviewSection.Visibility = Visibility.Collapsed;
+            _currentPersonalizationProposal = null;
+        }
     }
 }
