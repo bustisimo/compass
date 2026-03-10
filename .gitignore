@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+
+# User settings (may contain API keys)
+settings.json
+shortcuts.json
+
+# IDE / Editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.sln.docstates
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# NuGet
+*.nupkg
+packages/
+
+# Publish output
+publish/

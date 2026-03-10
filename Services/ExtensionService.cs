@@ -1,13 +1,22 @@
 using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
+using Compass.Services.Interfaces;
+using Microsoft.Extensions.Logging;
 
 namespace Compass.Services;
 
-public class ExtensionService
+public class ExtensionService : IExtensionService
 {
-    public readonly string ExtensionsPath = Path.Combine(
+    public string ExtensionsPath { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Compass", "Extensions");
+
+    private readonly ILogger<ExtensionService> _logger;
+
+    public ExtensionService(ILogger<ExtensionService> logger)
+    {
+        _logger = logger;
+    }
 
     public void EnsureExtensionsFolderExists()
     {
@@ -30,7 +39,7 @@ public class ExtensionService
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[Compass] LoadExtensions '{file}': {ex.Message}");
+                _logger.LogError(ex, "Failed to load extension from {File}", file);
             }
         }
         return result;
@@ -49,18 +58,42 @@ public class ExtensionService
         if (File.Exists(path))
         {
             try { File.Delete(path); }
-            catch (Exception ex) { Debug.WriteLine($"[Compass] DeleteExtension '{triggerName}': {ex.Message}"); }
+            catch (Exception ex) { _logger.LogError(ex, "Failed to delete extension {TriggerName}", triggerName); }
         }
     }
 
-    public void ExecuteExtension(CompassExtension ext)
+    public string ExecuteExtension(CompassExtension ext)
     {
-        string script = ext.PowerShellScript.Replace("\"", "\\\"");
-        var psi = new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
+        string tempFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"compass_{Guid.NewGuid():N}.ps1");
+        try
         {
-            CreateNoWindow = true,
-            UseShellExecute = false
-        };
-        Process.Start(psi);
+            File.WriteAllText(tempFile, ext.PowerShellScript);
+
+            var psi = new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -File \"{tempFile}\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null)
+                return "Error: Failed to start PowerShell process.";
+
+            string stdout = process.StandardOutput.ReadToEnd();
+            string stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit(60000); // 60 second timeout
+
+            if (!string.IsNullOrWhiteSpace(stderr))
+                return $"Output:\n{stdout}\n\nErrors:\n{stderr}".Trim();
+
+            return string.IsNullOrWhiteSpace(stdout) ? "Command completed successfully." : stdout.Trim();
+        }
+        finally
+        {
+            try { if (File.Exists(tempFile)) File.Delete(tempFile); }
+            catch { /* best-effort cleanup */ }
+        }
     }
 }
