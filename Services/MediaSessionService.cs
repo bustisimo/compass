@@ -1,12 +1,17 @@
-using System.Diagnostics;
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using Windows.Media.Control;
+using Windows.Storage.Streams;
 
 namespace Compass.Services;
 
 public class MediaSessionService
 {
     private readonly ILogger<MediaSessionService> _logger;
+    private static readonly string _thumbPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "compass_albumart.png");
+
+    // Cache the session manager so we don't call RequestAsync() every poll
+    private GlobalSystemMediaTransportControlsSessionManager? _sessionManager;
+    private string _lastThumbHash = "";
 
     public MediaSessionService(ILogger<MediaSessionService> logger)
     {
@@ -17,95 +22,84 @@ public class MediaSessionService
     {
         try
         {
-            // Use PowerShell to get media info via WinRT APIs
-            string script = @"
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$null = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime]
-$asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
-$typeName = 'System.WindowsRuntimeSystemExtensions'
-$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
-$asTask = $asTaskGeneric.MakeGenericMethod([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
-$netTask = $asTask.Invoke($null, @($asyncOp))
-$null = $netTask.Wait(5000)
-$sessionManager = $netTask.Result
-$session = $sessionManager.GetCurrentSession()
-if ($session) {
-    $mediaTask = $session.TryGetMediaPropertiesAsync()
-    $asTask2 = $asTaskGeneric.MakeGenericMethod([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
-    $netTask2 = $asTask2.Invoke($null, @($mediaTask))
-    $null = $netTask2.Wait(5000)
-    $media = $netTask2.Result
-    $playback = $session.GetPlaybackInfo()
-    @{
-        Title = $media.Title
-        Artist = $media.Artist
-        AlbumTitle = $media.AlbumTitle
-        IsPlaying = ($playback.PlaybackStatus -eq 'Playing')
-    } | ConvertTo-Json -Compress
-} else {
-    Write-Output '{}'
-}";
+            // Cache the session manager — only request once
+            _sessionManager ??= await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
 
-            var result = await Task.Run(() => RunPowerShell(script));
+            var session = _sessionManager.GetCurrentSession();
+            if (session == null) return null;
 
-            if (!string.IsNullOrWhiteSpace(result) && result.TrimStart().StartsWith('{'))
+            var mediaProps = await session.TryGetMediaPropertiesAsync();
+            var playback = session.GetPlaybackInfo();
+
+            var title = mediaProps.Title ?? "";
+            var artist = mediaProps.Artist ?? "";
+            var album = mediaProps.AlbumTitle ?? "";
+            var isPlaying = playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
+
+            if (string.IsNullOrEmpty(title) && string.IsNullOrEmpty(artist))
+                return null;
+
+            // Check if the song changed
+            string hash = $"{title}_{artist}_{album}";
+            string thumbFile = "";
+
+            if (hash == _lastThumbHash && System.IO.File.Exists(_thumbPath))
             {
-                using var doc = JsonDocument.Parse(result);
-                var root = doc.RootElement;
-
-                if (root.TryGetProperty("Title", out var title) && !string.IsNullOrEmpty(title.GetString()))
+                // Same song — reuse cached thumbnail, skip stream entirely
+                thumbFile = _thumbPath;
+            }
+            else
+            {
+                // New song — extract thumbnail
+                try
                 {
-                    return new MediaInfo
+                    if (mediaProps.Thumbnail != null)
                     {
-                        Title = title.GetString() ?? "",
-                        Artist = root.TryGetProperty("Artist", out var artist) ? artist.GetString() ?? "" : "",
-                        AlbumTitle = root.TryGetProperty("AlbumTitle", out var album) ? album.GetString() ?? "" : "",
-                        IsPlaying = root.TryGetProperty("IsPlaying", out var playing) && playing.GetBoolean()
-                    };
+                        var streamRef = mediaProps.Thumbnail;
+                        using var stream = await streamRef.OpenReadAsync();
+                        var size = (uint)stream.Size;
+                        if (size > 0)
+                        {
+                            var buffer = new Windows.Storage.Streams.Buffer(size);
+                            await stream.ReadAsync(buffer, size, InputStreamOptions.None);
+
+                            var bytes = new byte[buffer.Length];
+                            using var reader = DataReader.FromBuffer(buffer);
+                            reader.ReadBytes(bytes);
+
+                            await System.IO.File.WriteAllBytesAsync(_thumbPath, bytes);
+                            _lastThumbHash = hash;
+                            thumbFile = _thumbPath;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to extract album art");
+                    // Still return media info without thumbnail
+                    if (System.IO.File.Exists(_thumbPath))
+                        thumbFile = _thumbPath;
                 }
             }
+
+            // Get the source app ID (e.g. "Spotify.exe", "chrome.exe")
+            string sourceApp = "";
+            try { sourceApp = session.SourceAppUserModelId ?? ""; } catch { }
+
+            return new MediaInfo
+            {
+                Title = title,
+                Artist = artist,
+                AlbumTitle = album,
+                IsPlaying = isPlaying,
+                ThumbnailPath = thumbFile,
+                SourceAppId = sourceApp
+            };
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to get media session info");
+            return null;
         }
-
-        return null;
-    }
-
-    private static string RunPowerShell(string script)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = "powershell.exe",
-            Arguments = "-NoProfile -ExecutionPolicy Bypass -Command -",
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-
-        using var process = Process.Start(psi);
-        if (process == null) return "{}";
-
-        process.StandardInput.Write(script);
-        process.StandardInput.Close();
-
-        // Read stderr asynchronously to prevent deadlock when the pipe buffer fills
-        string error = "";
-        process.ErrorDataReceived += (s, e) => { if (e.Data != null) error += e.Data; };
-        process.BeginErrorReadLine();
-
-        string output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit(10000);
-
-        if (!process.HasExited)
-        {
-            try { process.Kill(); } catch { }
-            return "{}";
-        }
-
-        return output.Trim();
     }
 }

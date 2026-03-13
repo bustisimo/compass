@@ -5,7 +5,7 @@ public class AppSettings
     public string ApiKey { get; set; } = "";
     public double WindowOpacity { get; set; } = 1.0;
     public bool LaunchAtStartup { get; set; } = false;
-    public string SystemPrompt { get; set; } = "You are Compass, a friendly and cheerful Windows desktop assistant. Be conversational, warm, and concise. Match the user's energy — if they say \"ping!\", reply \"pong!\". If they're casual, be casual back. Only use the execute_wmi_query tool when the user specifically asks about their system, hardware, or performance. For general conversation, questions, or tasks, just respond naturally without calling any tools.";
+    public string SystemPrompt { get; set; } = "You are Compass, a friendly and cheerful Windows desktop assistant. Be conversational, warm, and concise. Match the user's energy — if they say \"ping!\", reply \"pong!\". If they're casual, be casual back. For general conversation, questions, or tasks, just respond naturally.";
     public string SelectedModel { get; set; } = "gemini-2.5-flash";
     public List<string> AvailableModels { get; set; } = new List<string> { "gemini-2.5-flash" };
 
@@ -13,7 +13,7 @@ public class AppSettings
     public bool SmartRoutingEnabled { get; set; } = false;
     public string FastModel { get; set; } = "gemini-2.5-flash-lite";
     public string PowerModel { get; set; } = "gemini-2.5-flash";
-    public string ImageGenerationModel { get; set; } = "gemini-2.5-flash-exp";
+    public string ImageGenerationModel { get; set; } = "gemini-2.5-flash-image";
 
     // Multi-provider AI (Phase 6)
     public string ActiveProvider { get; set; } = "Gemini";
@@ -52,6 +52,10 @@ public class AppSettings
     public string GradientEndColor { get; set; } = "";
     public double GradientAngle { get; set; } = 135.0;
 
+    // Advanced personalization - Background Image
+    public string BackgroundImagePath { get; set; } = "";
+    public double BackgroundImageOpacity { get; set; } = 0.6;
+
     // Advanced personalization - Window
     public double BorderThickness { get; set; } = 1.0;
 
@@ -80,8 +84,8 @@ public class AppSettings
     public List<string> PinnedWidgetIds { get; set; } = new();
     public Dictionary<string, FloatingWidgetPosition> FloatingWidgets { get; set; } = new();
     public Dictionary<string, string> WidgetSizes { get; set; } = new(); // widgetId -> "1x1" or "2x1"
-    public List<string> EnabledWidgetIds { get; set; } = new() { "builtin-clock", "builtin-weather", "builtin-systemstats", "builtin-calendar", "builtin-media" };
-    public List<string> WidgetOrder { get; set; } = new() { "builtin-clock", "builtin-weather", "builtin-systemstats", "builtin-calendar", "builtin-media" };
+    public List<string> EnabledWidgetIds { get; set; } = new() { "builtin-clock", "builtin-weather", "builtin-systemstats", "builtin-calendar", "builtin-media", "builtin-notes" };
+    public List<string> WidgetOrder { get; set; } = new() { "builtin-clock", "builtin-weather", "builtin-systemstats", "builtin-calendar", "builtin-media", "builtin-notes" };
     public double WeatherLatitude { get; set; } = 0;
     public double WeatherLongitude { get; set; } = 0;
     public string WeatherLocationName { get; set; } = "";
@@ -117,6 +121,8 @@ public class AppSettings
         GradientEndColor = source.GradientEndColor;
         GradientAngle = source.GradientAngle;
         BorderThickness = source.BorderThickness;
+        BackgroundImagePath = source.BackgroundImagePath;
+        BackgroundImageOpacity = source.BackgroundImageOpacity;
     }
 }
 

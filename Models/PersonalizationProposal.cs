@@ -22,6 +22,10 @@ public class PersonalizationProposal
     public double? GradientAngle { get; set; }
     public double? BorderThickness { get; set; }
 
+    // Background image generation
+    public string BackgroundImagePrompt { get; set; } = "";
+    public double? BackgroundImageOpacity { get; set; }
+
     /// <summary>
     /// Applies non-null/non-empty proposal fields to the target AppSettings.
     /// </summary>
@@ -63,5 +67,8 @@ public class PersonalizationProposal
             target.GradientAngle = GradientAngle.Value;
         if (BorderThickness.HasValue && BorderThickness >= 0)
             target.BorderThickness = BorderThickness.Value;
+        if (BackgroundImageOpacity.HasValue && BackgroundImageOpacity >= 0 && BackgroundImageOpacity <= 1)
+            target.BackgroundImageOpacity = BackgroundImageOpacity.Value;
+        // BackgroundImagePrompt is consumed by the personalization flow, not applied directly
     }
 }

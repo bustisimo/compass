@@ -2,16 +2,19 @@ using System.Diagnostics;
 using System.IO;
 using System.Windows.Media;
 using Compass.Services;
+using Microsoft.Extensions.Logging;
 
 namespace Compass.Plugins;
 
 public class RecentFilesPlugin : ICompassPlugin
 {
     private readonly RecentFilesService _recentFilesService;
+    private readonly ILogger<RecentFilesPlugin> _logger;
 
-    public RecentFilesPlugin(RecentFilesService recentFilesService)
+    public RecentFilesPlugin(RecentFilesService recentFilesService, ILogger<RecentFilesPlugin> logger)
     {
         _recentFilesService = recentFilesService;
+        _logger = logger;
     }
 
     public string Name => "Recent Files";
@@ -47,7 +50,7 @@ public class RecentFilesPlugin : ICompassPlugin
                 Process.Start(new ProcessStartInfo { FileName = result.FilePath, UseShellExecute = true });
                 return Task.FromResult<string?>("Opened file");
             }
-            catch (Exception ex) { Serilog.Log.Warning(ex, "Failed to open recent file"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to open recent file: {Path}", result.FilePath); }
         }
         return Task.FromResult<string?>(null);
     }

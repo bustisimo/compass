@@ -73,48 +73,54 @@ public partial class App : Application
         services.AddSingleton<ISystemCommandService, SystemCommandService>();
         services.AddSingleton<IModelRoutingService, ModelRoutingService>();
 
-        // Phase 6: AI providers
+        // AI providers
         services.AddSingleton<GeminiProvider>();
         services.AddSingleton<OpenAiProvider>();
         services.AddSingleton<AnthropicProvider>();
         services.AddSingleton<OllamaProvider>();
         services.AddSingleton<AiProviderRegistry>();
 
-        // Phase 7: Chat history
+        // Chat history
         services.AddSingleton<ChatHistoryService>();
 
-        // Phase 8: File search
+        // File search
         services.AddSingleton<FileIndexService>();
 
-        // Phase 9: Calculator
+        // Calculator
         services.AddSingleton<CalculatorService>();
 
-        // Phase 10: Clipboard history
+        // Clipboard history
         services.AddSingleton<ClipboardHistoryService>();
 
-        // Phase 11: Snippets
+        // Snippets
         services.AddSingleton<SnippetService>();
 
-        // Phase 12: PowerShell sandbox
+        // PowerShell sandbox
         services.AddSingleton<PowerShellSandbox>();
 
-        // Phase 13: Themes
+        // Themes
         services.AddSingleton<ThemeManager>();
 
-        // Phase 16: Plugin host
+        // Plugin host
         services.AddSingleton<PluginHost>();
 
-        // Phase 17: Update service
+        // Update service
         services.AddSingleton<UpdateService>();
 
-        // Phase 18: Settings sync
+        // Settings sync
         services.AddSingleton<SettingsSyncService>();
 
-        // Phase 19: Widgets
+        // Quick actions
+        services.AddSingleton<QuickActionsService>();
+
+        // Notes
+        services.AddSingleton<NotesService>();
+
+        // Widgets
         services.AddSingleton<IWidgetService, WidgetService>();
         services.AddSingleton<WeatherService>();
 
-        // New services for feature expansion
+        // Additional services
         services.AddSingleton<FileContentSearchService>();
         services.AddSingleton<BookmarkService>();
         services.AddSingleton<RecentFilesService>();
@@ -136,35 +142,57 @@ public partial class App : Application
         var logger = _serviceProvider.GetRequiredService<ILogger<App>>();
         logger.LogInformation("Compass starting up");
 
-        // Activate plugin system (Wave 0A)
+        // Register plugins (lightweight — just adds to list)
         var pluginHost = _serviceProvider.GetRequiredService<PluginHost>();
         pluginHost.Register(new CalculatorPlugin(_serviceProvider.GetRequiredService<CalculatorService>()));
         pluginHost.Register(new ClipboardPlugin(_serviceProvider.GetRequiredService<ClipboardHistoryService>()));
         pluginHost.Register(new SnippetPlugin(_serviceProvider.GetRequiredService<SnippetService>()));
-        pluginHost.Register(new FileSearchPlugin(_serviceProvider.GetRequiredService<FileContentSearchService>()));
-        pluginHost.Register(new BookmarkPlugin(_serviceProvider.GetRequiredService<BookmarkService>()));
-        pluginHost.Register(new RecentFilesPlugin(_serviceProvider.GetRequiredService<RecentFilesService>()));
+        pluginHost.Register(new FileSearchPlugin(
+            _serviceProvider.GetRequiredService<FileContentSearchService>(),
+            _serviceProvider.GetRequiredService<ILogger<FileSearchPlugin>>()));
+        pluginHost.Register(new BookmarkPlugin(
+            _serviceProvider.GetRequiredService<BookmarkService>(),
+            _serviceProvider.GetRequiredService<ILogger<BookmarkPlugin>>()));
+        pluginHost.Register(new RecentFilesPlugin(
+            _serviceProvider.GetRequiredService<RecentFilesService>(),
+            _serviceProvider.GetRequiredService<ILogger<RecentFilesPlugin>>()));
         pluginHost.Register(new QuickTogglePlugin(_serviceProvider.GetRequiredService<ISystemCommandService>()));
-        _ = SafeFireAndForget(pluginHost.InitializeAllAsync(), logger, "Plugin initialization");
 
-        // Initialize file content search if enabled
-        var settingsService = _serviceProvider.GetRequiredService<ISettingsService>();
-        var appSettings = settingsService.LoadSettings();
-        if (appSettings.FileContentSearchEnabled && appSettings.FileSearchDirectories.Count > 0)
-        {
-            var fileSearchService = _serviceProvider.GetRequiredService<FileContentSearchService>();
-            fileSearchService.StartIndexing(appSettings.FileSearchDirectories, appSettings.FileContentSearchExtensions);
-        }
-
-        // Initialize RAG if enabled
-        if (appSettings.RagEnabled && appSettings.RagDirectories.Count > 0)
-        {
-            var ragService = _serviceProvider.GetRequiredService<RagService>();
-            ragService.StartIndexing(appSettings.RagDirectories);
-        }
-
+        // Show the window first, then stagger heavy init to avoid 100% CPU spike
         var mainWindow = _serviceProvider.GetRequiredService<MainWindow>();
         mainWindow.Show();
+
+        var settingsService = _serviceProvider.GetRequiredService<ISettingsService>();
+        var appSettings = settingsService.LoadSettings();
+
+        _ = SafeFireAndForget(StaggeredInitAsync(pluginHost, appSettings, logger), logger, "Staggered initialization");
+    }
+
+    /// <summary>
+    /// Staggers heavy startup work so it doesn't all compete for CPU simultaneously.
+    /// </summary>
+    private async Task StaggeredInitAsync(PluginHost pluginHost, AppSettings appSettings, Microsoft.Extensions.Logging.ILogger logger)
+    {
+        // Phase 1: Plugin initialization (bookmarks, recent files, etc.)
+        await pluginHost.InitializeAllAsync();
+
+        // Brief pause to let CPU settle before next heavy phase
+        await Task.Delay(500);
+
+        // Phase 2: File content search indexing (if enabled)
+        if (appSettings.FileContentSearchEnabled && appSettings.FileSearchDirectories.Count > 0)
+        {
+            var fileSearchService = _serviceProvider!.GetRequiredService<FileContentSearchService>();
+            fileSearchService.StartIndexing(appSettings.FileSearchDirectories, appSettings.FileContentSearchExtensions);
+            await Task.Delay(500);
+        }
+
+        // Phase 3: RAG indexing (if enabled) — heaviest operation, runs last
+        if (appSettings.RagEnabled && appSettings.RagDirectories.Count > 0)
+        {
+            var ragService = _serviceProvider!.GetRequiredService<RagService>();
+            ragService.StartIndexing(appSettings.RagDirectories);
+        }
     }
 
     private static async Task SafeFireAndForget(Task task, Microsoft.Extensions.Logging.ILogger logger, string context)

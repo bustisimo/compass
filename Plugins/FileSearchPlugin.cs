@@ -1,16 +1,19 @@
 using System.Diagnostics;
 using System.Windows.Media;
 using Compass.Services;
+using Microsoft.Extensions.Logging;
 
 namespace Compass.Plugins;
 
 public class FileSearchPlugin : ICompassPlugin
 {
     private readonly FileContentSearchService _searchService;
+    private readonly ILogger<FileSearchPlugin> _logger;
 
-    public FileSearchPlugin(FileContentSearchService searchService)
+    public FileSearchPlugin(FileContentSearchService searchService, ILogger<FileSearchPlugin> logger)
     {
         _searchService = searchService;
+        _logger = logger;
     }
 
     public string Name => "File Content Search";
@@ -42,7 +45,7 @@ public class FileSearchPlugin : ICompassPlugin
                 Process.Start(new ProcessStartInfo { FileName = result.FilePath, UseShellExecute = true });
                 return Task.FromResult<string?>("Opened file");
             }
-            catch (Exception ex) { Serilog.Log.Warning(ex, "Failed to open file"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to open file: {Path}", result.FilePath); }
         }
         return Task.FromResult<string?>(null);
     }

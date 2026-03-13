@@ -20,6 +20,11 @@ public class GeminiResponse
 public class GeminiService : IGeminiService
 {
     private static readonly HttpClient _httpClient = new();
+    private static readonly JsonSerializerOptions _jsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
     private readonly List<Content> _chatHistory = new();
     private readonly ILogger<GeminiService> _logger;
     private const int MaxToolRounds = 5;
@@ -46,7 +51,22 @@ public class GeminiService : IGeminiService
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex ImageGenerationPattern = new(
-        @"\b(generate an? image|draw|create a picture|create an? image|make a picture|make an? image|paint|sketch|illustrate|render an? image|generate a picture)\b",
+        @"\b(generate an? (image|picture|photo|artwork|illustration|graphic|icon|logo|wallpaper|poster|banner)" +
+        @"|create an? (image|picture|photo|artwork|illustration|graphic|icon|logo|wallpaper|poster|banner)" +
+        @"|make an? (image|picture|photo|artwork|illustration|graphic|icon|logo|wallpaper|poster|banner)" +
+        @"|render an? (image|picture|photo|artwork|illustration)" +
+        @"|draw (me |a |an |the )?" +
+        @"|paint (me |a |an |the )?" +
+        @"|sketch (me |a |an |the )?" +
+        @"|illustrate\b" +
+        @"|design an? (image|logo|icon|poster|banner|graphic)" +
+        @"|visualize\b" +
+        @"|show me what .+ looks? like" +
+        @"|picture of\b" +
+        @"|photo of\b" +
+        @"|image of\b" +
+        @"|can you (draw|paint|sketch|create|generate|make|design|render)" +
+        @")\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private readonly PowerShellSandbox _sandbox;
@@ -61,14 +81,104 @@ public class GeminiService : IGeminiService
 
     public void ClearHistory() => _chatHistory.Clear();
 
-    public List<(string role, string text)> GetExportableHistory()
+    public void RemoveLastExchange()
     {
-        var result = new List<(string, string)>();
+        // Walk backwards and remove trailing model/function entries
+        while (_chatHistory.Count > 0)
+        {
+            var last = _chatHistory[^1];
+            if (last.Role is "model" or "function")
+                _chatHistory.RemoveAt(_chatHistory.Count - 1);
+            else
+                break;
+        }
+        // Remove the last user entry
+        if (_chatHistory.Count > 0 && _chatHistory[^1].Role == "user")
+            _chatHistory.RemoveAt(_chatHistory.Count - 1);
+    }
+
+    public string SerializeHistory()
+    {
+        var entries = new List<Dictionary<string, object>>();
+        foreach (var entry in _chatHistory)
+        {
+            string? text = entry.Parts?.FirstOrDefault(p => p.Text != null)?.Text;
+            if (string.IsNullOrWhiteSpace(text) && entry.Parts?.Any(p => p.InlineData?.Data != null) != true)
+                continue;
+
+            var dict = new Dictionary<string, object>
+            {
+                { "role", entry.Role ?? "user" },
+                { "text", text ?? "" }
+            };
+
+            // Save inline image data as base64
+            var images = entry.Parts?
+                .Where(p => p.InlineData?.Data != null && p.InlineData.Data.Length > 0)
+                .Select(p => new Dictionary<string, string>
+                {
+                    { "data", Convert.ToBase64String(p.InlineData!.Data!) },
+                    { "mimeType", p.InlineData.MimeType ?? "image/png" }
+                })
+                .ToList();
+
+            if (images != null && images.Count > 0)
+                dict["images"] = images;
+
+            entries.Add(dict);
+        }
+        return JsonSerializer.Serialize(entries);
+    }
+
+    public void LoadSerializedHistory(string json)
+    {
+        _chatHistory.Clear();
+        var entries = JsonSerializer.Deserialize<List<Dictionary<string, JsonElement>>>(json);
+        if (entries == null) return;
+        foreach (var entry in entries)
+        {
+            string role = entry.TryGetValue("role", out var r) ? r.GetString() ?? "user" : "user";
+            string text = entry.TryGetValue("text", out var t) ? t.GetString() ?? "" : "";
+
+            var parts = new List<Part>();
+            if (!string.IsNullOrEmpty(text))
+                parts.Add(new Part { Text = text });
+
+            // Restore inline image data
+            if (entry.TryGetValue("images", out var imagesEl) && imagesEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var imgEl in imagesEl.EnumerateArray())
+                {
+                    string? b64 = imgEl.TryGetProperty("data", out var d) ? d.GetString() : null;
+                    string mime = imgEl.TryGetProperty("mimeType", out var m) ? m.GetString() ?? "image/png" : "image/png";
+                    if (!string.IsNullOrEmpty(b64))
+                    {
+                        parts.Add(new Part
+                        {
+                            InlineData = new Blob { Data = Convert.FromBase64String(b64), MimeType = mime }
+                        });
+                    }
+                }
+            }
+
+            if (parts.Count > 0)
+                _chatHistory.Add(new Content { Role = role, Parts = parts });
+        }
+    }
+
+    public List<(string role, string text, List<(byte[] data, string mimeType)> images)> GetExportableHistoryWithImages()
+    {
+        var result = new List<(string, string, List<(byte[], string)>)>();
         foreach (var entry in _chatHistory)
         {
             if (entry.Role == "function") continue;
             string? text = entry.Parts?.FirstOrDefault(p => p.Text != null)?.Text;
-            if (string.IsNullOrWhiteSpace(text)) continue;
+            var images = entry.Parts?
+                .Where(p => p.InlineData?.Data != null && p.InlineData.Data.Length > 0)
+                .Select(p => (p.InlineData!.Data!, p.InlineData.MimeType ?? "image/png"))
+                .ToList() ?? new();
+
+            if (string.IsNullOrWhiteSpace(text) && images.Count == 0) continue;
 
             string role = entry.Role switch
             {
@@ -76,9 +186,16 @@ public class GeminiService : IGeminiService
                 "model" => "Compass",
                 _ => entry.Role ?? "Unknown"
             };
-            result.Add((role, text));
+            result.Add((role, text ?? "", images));
         }
         return result;
+    }
+
+    public List<(string role, string text)> GetExportableHistory()
+    {
+        return GetExportableHistoryWithImages()
+            .Select(e => (e.role, e.text))
+            .ToList();
     }
 
     public async Task<GeminiResponse> AskAsync(
@@ -126,10 +243,16 @@ public class GeminiService : IGeminiService
 
         if (isImageGen)
         {
+            // Image models work best with a single-turn request — no chat history,
+            // no system instruction, no tools. Send only the current user message.
+            var imageContent = new Content
+            {
+                Role = "user",
+                Parts = userParts
+            };
             requestBody = new
             {
-                contents = _chatHistory,
-                systemInstruction = new { parts = new[] { new { text = settings.SystemPrompt } } },
+                contents = new[] { imageContent },
                 generationConfig = new { responseModalities = new[] { "TEXT", "IMAGE" } }
             };
             model = imageGenModel;
@@ -163,48 +286,9 @@ public class GeminiService : IGeminiService
                 if (candidate?.Content != null)
                     _chatHistory.Add(candidate.Content);
 
-                // Execute all function calls (parallel calls in one response)
-                var functionResponseParts = new List<Part>();
-                foreach (var fcPart in functionCallParts)
-                {
-                    var functionCall = fcPart.FunctionCall!;
-                    if (functionCall.Name == "execute_wmi_query")
-                    {
-                        object? queryObj = null;
-                        functionCall.Args?.TryGetValue("query", out queryObj);
-                        string? wqlQuery = queryObj?.ToString();
-                        string wmiResult = string.IsNullOrWhiteSpace(wqlQuery)
-                            ? "Error: No query provided."
-                            : ExecuteWmiQuery(wqlQuery);
-
-                        functionResponseParts.Add(new Part
-                        {
-                            FunctionResponse = new FunctionResponse
-                            {
-                                Name = "execute_wmi_query",
-                                Response = new Dictionary<string, object> { { "result", wmiResult } }
-                            }
-                        });
-                    }
-                    else if (functionCall.Name == "execute_powershell")
-                    {
-                        object? scriptObj = null;
-                        functionCall.Args?.TryGetValue("script", out scriptObj);
-                        string? script = scriptObj?.ToString();
-                        string psResult = string.IsNullOrWhiteSpace(script)
-                            ? "Error: No script provided."
-                            : _sandbox.Execute(script);
-
-                        functionResponseParts.Add(new Part
-                        {
-                            FunctionResponse = new FunctionResponse
-                            {
-                                Name = "execute_powershell",
-                                Response = new Dictionary<string, object> { { "result", psResult } }
-                            }
-                        });
-                    }
-                }
+                // Execute all function calls
+                var functionResponseParts = ExecuteFunctionCalls(
+                    functionCallParts.Select(p => p.FunctionCall!));
 
                 if (functionResponseParts.Count == 0)
                     break;
@@ -257,6 +341,156 @@ public class GeminiService : IGeminiService
             result.Text = "I received an empty response from the API. Please try rephrasing your question.";
 
         return result;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Streaming API
+    // ---------------------------------------------------------------------------
+
+    public async Task<GeminiResponse> AskStreamingAsync(
+        string prompt,
+        AppSettings settings,
+        Action<string> onChunk,
+        CancellationToken cancellationToken = default,
+        string? modelOverride = null)
+    {
+        string model = modelOverride ?? settings.SelectedModel;
+
+        var userParts = new List<Part> { new Part { Text = prompt } };
+        _chatHistory.Add(new Content { Role = "user", Parts = userParts });
+
+        var wmiTool = BuildTools();
+        var requestBody = new
+        {
+            contents = _chatHistory,
+            systemInstruction = new { parts = new[] { new { text = settings.SystemPrompt } } },
+            tools = new[] { wmiTool }
+        };
+
+        // First call — try streaming
+        var (streamedText, functionCalls, rawParts) = await ExecuteStreamingRequest(requestBody, settings, onChunk, cancellationToken, model);
+
+        // If function calls were returned, handle them non-streaming then stream the follow-up
+        if (functionCalls.Count > 0)
+        {
+            // Add the model's original response parts to history (preserves thought_signature)
+            _chatHistory.Add(new Content { Role = "model", Parts = rawParts });
+
+            for (int round = 0; round < MaxToolRounds; round++)
+            {
+                var functionResponseParts = ExecuteFunctionCalls(functionCalls);
+
+                if (functionResponseParts.Count == 0) break;
+
+                _chatHistory.Add(new Content { Role = "function", Parts = functionResponseParts });
+
+                var followUpBody = new
+                {
+                    contents = _chatHistory,
+                    systemInstruction = new { parts = new[] { new { text = settings.SystemPrompt } } },
+                    tools = new[] { wmiTool }
+                };
+
+                // Stream the follow-up response
+                var (followUpText, followUpCalls, followUpRawParts) = await ExecuteStreamingRequest(followUpBody, settings, onChunk, cancellationToken, model);
+                streamedText = followUpText;
+                functionCalls = followUpCalls;
+                rawParts = followUpRawParts;
+
+                if (functionCalls.Count == 0) break;
+
+                // More function calls — add original parts to history (preserves thought_signature)
+                _chatHistory.Add(new Content { Role = "model", Parts = rawParts });
+            }
+        }
+
+        // Add final response to history
+        if (!string.IsNullOrEmpty(streamedText))
+        {
+            _chatHistory.Add(new Content
+            {
+                Role = "model",
+                Parts = new List<Part> { new Part { Text = streamedText } }
+            });
+        }
+
+        var result = new GeminiResponse { ModelUsed = model, Text = streamedText };
+        if (string.IsNullOrWhiteSpace(result.Text))
+            result.Text = "I received an empty response from the API. Please try rephrasing your question.";
+
+        return result;
+    }
+
+    private static async Task<(string text, List<FunctionCall> functionCalls, List<Part> rawModelParts)> ExecuteStreamingRequest(
+        object requestBody,
+        AppSettings settings,
+        Action<string> onChunk,
+        CancellationToken cancellationToken,
+        string model)
+    {
+        if (string.IsNullOrWhiteSpace(settings.ApiKey))
+            throw new InvalidOperationException("API key is not configured.");
+
+        var url = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?key={settings.ApiKey}&alt=sse";
+        var json = JsonSerializer.Serialize(requestBody, _jsonOptions);
+        var httpContent = new StringContent(json, Encoding.UTF8, "application/json");
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = httpContent };
+        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            string errText = await response.Content.ReadAsStringAsync(cancellationToken);
+            throw new HttpRequestException($"API error {response.StatusCode}: {errText}");
+        }
+
+        var fullText = new StringBuilder();
+        var functionCalls = new List<FunctionCall>();
+        var rawModelParts = new List<Part>();
+
+        using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new System.IO.StreamReader(stream);
+
+        while (!reader.EndOfStream)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var line = await reader.ReadLineAsync();
+            if (line == null) break;
+
+            if (!line.StartsWith("data: ")) continue;
+            var jsonData = line.Substring(6).Trim();
+            if (string.IsNullOrEmpty(jsonData)) continue;
+
+            try
+            {
+                var chunk = JsonSerializer.Deserialize<GenerateContentResponse>(jsonData, _jsonOptions);
+
+                var candidate = chunk?.Candidates?.FirstOrDefault();
+                if (candidate?.Content?.Parts == null) continue;
+
+                foreach (var part in candidate.Content.Parts)
+                {
+                    // Preserve the original part (includes thought_signature etc.)
+                    rawModelParts.Add(part);
+
+                    if (part.Text != null)
+                    {
+                        fullText.Append(part.Text);
+                        onChunk(part.Text);
+                    }
+                    if (part.FunctionCall != null)
+                    {
+                        functionCalls.Add(part.FunctionCall);
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // Skip malformed SSE chunks
+            }
+        }
+
+        return (fullText.ToString(), functionCalls, rawModelParts);
     }
 
     private static readonly string PowerShellSystemPrompt = @"You are a Windows automation expert specializing in PowerShell scripting. Write a safe, functional PowerShell script for the user's request.
@@ -499,6 +733,49 @@ Current theme colors for consistency:
         return false;
     }
 
+    public async Task<(byte[] data, string mimeType)?> GenerateImageAsync(
+        string prompt,
+        AppSettings settings,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var userContent = new Content
+            {
+                Role = "user",
+                Parts = new List<Part> { new Part { Text = prompt } }
+            };
+
+            var requestBody = new
+            {
+                contents = new[] { userContent },
+                generationConfig = new { responseModalities = new[] { "TEXT", "IMAGE" } }
+            };
+
+            string model = settings.ImageGenerationModel;
+            var response = await ExecuteRequest(requestBody, settings, cancellationToken, model);
+
+            var candidate = response?.Candidates?.FirstOrDefault();
+            if (candidate?.Content?.Parts != null)
+            {
+                foreach (var part in candidate.Content.Parts)
+                {
+                    if (part.InlineData?.Data != null && part.InlineData.Data.Length > 0)
+                    {
+                        return (part.InlineData.Data, part.InlineData.MimeType ?? "image/png");
+                    }
+                }
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Image generation failed for prompt: {Prompt}", prompt);
+            return null;
+        }
+    }
+
     public static bool IsImageGenerationRequest(string prompt)
     {
         return ImageGenerationPattern.IsMatch(prompt);
@@ -515,11 +792,7 @@ Current theme colors for consistency:
 
         string model = modelOverride ?? settings.SelectedModel;
         var url = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.ApiKey}";
-        var json = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-        });
+        var json = JsonSerializer.Serialize(requestBody, _jsonOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
 
         using var response = await _httpClient.PostAsync(url, content, cancellationToken);
@@ -530,10 +803,48 @@ Current theme colors for consistency:
         }
 
         using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        return await JsonSerializer.DeserializeAsync<GenerateContentResponse>(stream, new JsonSerializerOptions
+        return await JsonSerializer.DeserializeAsync<GenerateContentResponse>(stream, _jsonOptions, cancellationToken);
+    }
+
+    private List<Part> ExecuteFunctionCalls(IEnumerable<FunctionCall> functionCalls)
+    {
+        var responseParts = new List<Part>();
+        foreach (var fc in functionCalls)
         {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        }, cancellationToken);
+            if (fc.Name == "execute_wmi_query")
+            {
+                object? queryObj = null;
+                fc.Args?.TryGetValue("query", out queryObj);
+                string wmiResult = string.IsNullOrWhiteSpace(queryObj?.ToString())
+                    ? "Error: No query provided."
+                    : ExecuteWmiQuery(queryObj.ToString()!);
+                responseParts.Add(new Part
+                {
+                    FunctionResponse = new FunctionResponse
+                    {
+                        Name = "execute_wmi_query",
+                        Response = new Dictionary<string, object> { { "result", wmiResult } }
+                    }
+                });
+            }
+            else if (fc.Name == "execute_powershell")
+            {
+                object? scriptObj = null;
+                fc.Args?.TryGetValue("script", out scriptObj);
+                string psResult = string.IsNullOrWhiteSpace(scriptObj?.ToString())
+                    ? "Error: No script provided."
+                    : _sandbox.Execute(scriptObj.ToString()!);
+                responseParts.Add(new Part
+                {
+                    FunctionResponse = new FunctionResponse
+                    {
+                        Name = "execute_powershell",
+                        Response = new Dictionary<string, object> { { "result", psResult } }
+                    }
+                });
+            }
+        }
+        return responseParts;
     }
 
     private static Tool BuildTools() => new Tool
@@ -544,15 +855,19 @@ Current theme colors for consistency:
             {
                 Name = "execute_wmi_query",
                 Description = "Executes a WMI query to retrieve Windows system/hardware data. " +
-                    "ONLY call this when the user explicitly asks about their system, hardware, performance, or PC specs. " +
+                    "Call this whenever the user's question relates to their system, hardware, performance, PC health, or could benefit from real data — " +
+                    "even for indirect questions like 'should I reboot?', 'is my PC slow?', 'how's my computer doing?'. " +
                     "Do NOT call this for general conversation, greetings, or non-system questions. " +
-                    "For comprehensive system health checks, make MULTIPLE calls: " +
-                    "Win32_Processor (CPU — the result includes a multi-sample average), " +
-                    "Win32_PerfFormattedData_PerfOS_Memory (RAM), " +
-                    "Win32_LogicalDisk (disk space), " +
-                    "Win32_VideoController (GPU), " +
-                    "Win32_OperatingSystem (OS uptime, total memory). " +
-                    "You can issue multiple queries in a single response.",
+                    "For system health or reboot questions, ALWAYS query ALL of these (issue multiple calls): " +
+                    "1) Win32_Processor — CPU load (result includes multi-sample average). " +
+                    "2) Win32_OperatingSystem — CRITICAL: always query LastBootUpTime (uptime), TotalVisibleMemorySize, FreePhysicalMemory. " +
+                    "3) Win32_LogicalDisk — disk free space. " +
+                    "4) Win32_VideoController — GPU info. " +
+                    "When analyzing results, think critically and give actionable advice: " +
+                    "uptime over 3-4 days generally warrants a reboot for Windows stability and memory leaks; " +
+                    "RAM usage over 80% suggests too many processes or a memory leak; " +
+                    "sustained CPU over 50% at idle needs investigation. " +
+                    "Don't just list numbers — interpret them, flag concerns, and make a clear recommendation.",
                 Parameters = new Schema
                 {
                     Type = "object",

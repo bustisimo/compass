@@ -85,7 +85,7 @@ public class PluginHost : IDisposable
         foreach (var plugin in _plugins)
         {
             try { plugin.Dispose(); }
-            catch (Exception ex) { Serilog.Log.Warning(ex, "Plugin dispose failed"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Plugin dispose failed: {PluginName}", plugin.Name); }
         }
         _plugins.Clear();
     }

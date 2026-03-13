@@ -8,6 +8,8 @@ public interface ISystemCommandService
     void VolumeUp();
     void VolumeDown();
     void VolumeMute();
+    float GetMasterVolume();
+    void SetMasterVolume(float level);
     void MinimizeActiveWindow();
     void MaximizeActiveWindow();
     void RestoreActiveWindow();

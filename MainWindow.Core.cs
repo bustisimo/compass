@@ -35,6 +35,8 @@ public partial class MainWindow : Window
     private readonly NotificationService _notificationService;
     private readonly CalendarService _calendarService;
     private readonly MediaSessionService _mediaSessionService;
+    private readonly QuickActionsService _quickActionsService;
+    private readonly NotesService _notesService;
 
     // --- ViewModels ---
     private readonly SpotlightViewModel _spotlightVm;
@@ -53,6 +55,13 @@ public partial class MainWindow : Window
     private PersonalizationProposal? _currentPersonalizationProposal;
     private AppSettings? _settingsBackup;
     private bool _isSyncingPersonalization;
+    private string? _generatedPreviewImagePath;
+
+    // --- Image generation toggle ---
+    private bool _imageGenModeEnabled;
+
+    // --- Chat session state ---
+    private string? _currentChatSessionFile;
 
     // --- Cancellation & debounce ---
     private CancellationTokenSource? _chatCts;
@@ -91,9 +100,17 @@ public partial class MainWindow : Window
     private TimeSpan _timerRemaining;
     private DispatcherTimer? _alarmCheckerTimer;
     private DispatcherTimer? _clockExpandedTimer;
+    private DispatcherTimer? _mediaRefreshTimer;
+    private DispatcherTimer? _weatherRefreshTimer;
+    private DispatcherTimer? _minimizedMediaTimer;
+    private MediaInfo? _cachedMediaInfo;
+    private System.Windows.Media.Imaging.BitmapImage? _cachedAlbumArt;
+    private string _cachedAlbumArtHash = "";
+    private SystemStatsData? _cachedSystemStats;
 
     // --- Dialog state ---
     private TaskCompletionSource<bool>? _dialogTcs;
+    private bool _isFileDialogOpen;
 
     // --- Floating widget windows ---
     private readonly Dictionary<string, Window> _floatingWidgetWindows = new();
@@ -141,7 +158,6 @@ public partial class MainWindow : Window
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")]
     private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-
     private IntPtr _windowHandle;
     private HwndSource? _source;
 
@@ -179,6 +195,8 @@ public partial class MainWindow : Window
         NotificationService notificationService,
         CalendarService calendarService,
         MediaSessionService mediaSessionService,
+        QuickActionsService quickActionsService,
+        NotesService notesService,
         SpotlightViewModel spotlightVm,
         ChatViewModel chatVm,
         ManagerViewModel managerVm,
@@ -198,6 +216,8 @@ public partial class MainWindow : Window
         _notificationService = notificationService;
         _calendarService = calendarService;
         _mediaSessionService = mediaSessionService;
+        _quickActionsService = quickActionsService;
+        _notesService = notesService;
         _spotlightVm = spotlightVm;
         _chatVm = chatVm;
         _managerVm = managerVm;
@@ -227,10 +247,15 @@ public partial class MainWindow : Window
 
             FireAndForget(InitializeCacheAsync(), "InitializeCacheAsync");
 
+            // Pre-warm system stats cache early so widget panel opens fast
+            if (_appSettings.WidgetsEnabled)
+                FireAndForget(PreWarmSystemStatsAsync(), "PreWarmSystemStats");
+
             this.SizeChanged += MainWindow_SizeChanged;
             this.Deactivated += MainWindow_Deactivated;
             this.MouseDown += Window_MouseDown;
             this.IsVisibleChanged += MainWindow_IsVisibleChanged;
+            ModelPickerPopup.Closed += ModelPickerPopup_Closed;
 
             // Widget panel drag handling
             WidgetPanel.AllowDrop = true;
@@ -304,7 +329,12 @@ public partial class MainWindow : Window
 
     private void MainWindow_Deactivated(object? sender, EventArgs e)
     {
-        if (!_isPinned) this.Hide();
+        if (!_isPinned && !_isFileDialogOpen)
+        {
+            LoadChatPopup.IsOpen = false;
+            ModelPickerPopup.IsOpen = false;
+            this.Hide();
+        }
     }
 
     private void PinToggle_Click(object sender, MouseButtonEventArgs e)
@@ -345,9 +375,25 @@ public partial class MainWindow : Window
     {
         if (e.Key == Key.Escape)
         {
+            // Close model picker popup first if open
+            if (ModelPickerPopup.IsOpen)
+            {
+                ModelPickerPopup.IsOpen = false;
+                e.Handled = true;
+                return;
+            }
+
+            // Collapse expanded widget view back to widget grid
+            if (!string.IsNullOrEmpty(_expandedWidgetId))
+            {
+                CollapseExpandedWidget();
+                e.Handled = true;
+                return;
+            }
+
             if (ManagerView.Visibility == Visibility.Visible)
                 ExitManagerMode();
-            else if (ExitChatArrow.Visibility == Visibility.Visible)
+            else if (ChatScroll.Visibility == Visibility.Visible)
                 AnimateToSpotlightMode();
             else if (!string.IsNullOrEmpty(InputBox.Text))
             {
@@ -371,12 +417,14 @@ public partial class MainWindow : Window
         if (!RegisterHotKey(_windowHandle, HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE))
             MessageBox.Show("Hotkey registration failed. You might have started Compass already!", "Compass", MessageBoxButton.OK, MessageBoxImage.Warning);
 
-        RegisterHotKey(_windowHandle, HOTKEY_ID_COMMANDS, MOD_ALT | MOD_NOREPEAT, VK_OEM_2);
+        if (!RegisterHotKey(_windowHandle, HOTKEY_ID_COMMANDS, MOD_ALT | MOD_NOREPEAT, VK_OEM_2))
+            _logger.LogWarning("Failed to register Alt+/ hotkey — it may be in use by another application");
 
         const uint MOD_CTRL = 0x0002;
         const uint MOD_SHIFT = 0x0004;
         const uint VK_V = 0x56;
-        RegisterHotKey(_windowHandle, HOTKEY_ID_CLIPBOARD, MOD_CTRL | MOD_SHIFT | MOD_NOREPEAT, VK_V);
+        if (!RegisterHotKey(_windowHandle, HOTKEY_ID_CLIPBOARD, MOD_CTRL | MOD_SHIFT | MOD_NOREPEAT, VK_V))
+            _logger.LogWarning("Failed to register Ctrl+Shift+V hotkey — it may be in use by another application");
 
         _notificationService.OnToast += (title, message) => Dispatcher.Invoke(() => ShowToast(title, message));
 
@@ -396,6 +444,13 @@ public partial class MainWindow : Window
                 this.Activate();
                 WelcomeOverlay.Visibility = Visibility.Visible;
             });
+        }
+        else
+        {
+            // App.OnStartup calls Show() to create the HWND, but we should
+            // hide immediately so the first Alt+Space goes through ToggleWindow's
+            // show path which properly initializes widgets.
+            this.Hide();
         }
 
         RestoreFloatingWidgets();
@@ -455,6 +510,8 @@ public partial class MainWindow : Window
             SpotlightView.Visibility = Visibility.Visible;
             ExitManagerMode();
             ExitChatArrow.Visibility = Visibility.Collapsed;
+            LoadChatPopup.IsOpen = false;
+            ModelPickerPopup.IsOpen = false;
             this.Hide();
         }
         else

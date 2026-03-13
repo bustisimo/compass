@@ -25,3 +25,4 @@ packages/
 
 # Publish output
 publish/
+/.claude

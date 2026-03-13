@@ -1,11 +1,13 @@
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
+using Compass.Services;
 using Compass.Services.Interfaces;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
@@ -24,6 +26,7 @@ public partial class MainWindow
     private async Task AskGeminiAsync(string prompt, List<(byte[] data, string mimeType)>? images = null)
     {
         _chatCts?.Cancel();
+        _chatCts?.Dispose();
         _chatCts = new CancellationTokenSource();
         var token = _chatCts.Token;
 
@@ -44,21 +47,103 @@ public partial class MainWindow
                     augmentedPrompt = _ragService.BuildAugmentedPrompt(prompt, relevantChunks);
             }
 
-            string selectedModel = _routingService.SelectModel(augmentedPrompt, _appSettings, images?.Count > 0);
-            ShowTypingIndicator();
-            var geminiResponse = await _geminiService.AskAsync(augmentedPrompt, _appSettings, token, selectedModel, images);
-            RemoveTypingIndicator();
+            // Detect if this is an image generation request (auto or manual toggle)
+            bool isImageRequest = _imageGenModeEnabled || GeminiService.IsImageGenerationRequest(augmentedPrompt);
+            bool hasImages = images?.Count > 0;
 
-            if (!token.IsCancellationRequested)
+            string selectedModel;
+            if (isImageRequest)
+                selectedModel = _appSettings.ImageGenerationModel;
+            else
+                selectedModel = _routingService.SelectModel(augmentedPrompt, _appSettings, hasImages);
+
+            // Use streaming for text-only (non-image) requests without image attachments
+            bool useStreaming = !isImageRequest && !hasImages;
+
+            if (useStreaming)
             {
-                string senderLabel = _appSettings.SmartRoutingEnabled
-                    ? $"Gemini ({geminiResponse.ModelUsed})"
-                    : "Gemini";
+                ShowTypingIndicator();
 
-                if (geminiResponse.Images.Count > 0)
-                    AddChatBubbleWithGeneratedImages(senderLabel, geminiResponse.Text, geminiResponse.Images);
+                // Prepare the streaming bubble shell
+                string senderLabel = _appSettings.SmartRoutingEnabled ? "Gemini" : "Gemini";
+                TextBox? streamTextBox = null;
+                StackPanel? streamContentPanel = null;
+                bool bubbleCreated = false;
+
+                var geminiResponse = await _geminiService.AskStreamingAsync(
+                    augmentedPrompt, _appSettings,
+                    chunk => Dispatcher.Invoke(() =>
+                    {
+                        if (token.IsCancellationRequested) return;
+
+                        if (!bubbleCreated)
+                        {
+                            RemoveTypingIndicator();
+                            (streamTextBox, streamContentPanel) = CreateStreamingBubble(senderLabel);
+                            bubbleCreated = true;
+                        }
+
+                        // Append chunk to the live text box
+                        if (streamTextBox != null)
+                        {
+                            streamTextBox.Text += chunk;
+                            ChatScroll.ScrollToBottom();
+                        }
+                    }),
+                    token, selectedModel);
+
+                if (!token.IsCancellationRequested)
+                {
+                    // Update sender label with model info if smart routing is on
+                    if (_appSettings.SmartRoutingEnabled && bubbleCreated)
+                        UpdateStreamingBubbleSender(streamContentPanel, $"Gemini ({geminiResponse.ModelUsed})");
+
+                    // Re-render the bubble content with proper code block formatting
+                    if (bubbleCreated && streamContentPanel != null)
+                        FinalizeStreamingBubble(streamContentPanel, geminiResponse.Text);
+
+                    if (!bubbleCreated)
+                    {
+                        // No chunks arrived (empty response) — show as normal bubble
+                        RemoveTypingIndicator();
+                        AddChatBubble(senderLabel, geminiResponse.Text);
+                    }
+
+                    AddRetryButton();
+                    AutoSaveChatSession();
+                }
+            }
+            else
+            {
+                // Non-streaming path for image requests / image attachments
+                ShowTypingIndicator();
+
+                GeminiResponse geminiResponse;
+                if (isImageRequest && !GeminiService.IsImageGenerationRequest(augmentedPrompt))
+                {
+                    string imagePrompt = "Generate an image: " + augmentedPrompt;
+                    geminiResponse = await _geminiService.AskAsync(imagePrompt, _appSettings, token, selectedModel, images);
+                }
                 else
-                    AddChatBubble(senderLabel, geminiResponse.Text);
+                {
+                    geminiResponse = await _geminiService.AskAsync(augmentedPrompt, _appSettings, token, selectedModel, images);
+                }
+                RemoveTypingIndicator();
+
+                if (!token.IsCancellationRequested)
+                {
+                    string senderLabel = _appSettings.SmartRoutingEnabled
+                        ? $"Gemini ({geminiResponse.ModelUsed})"
+                        : "Gemini";
+
+                    if (geminiResponse.Images.Count > 0)
+                        AddChatBubbleWithGeneratedImages(senderLabel, geminiResponse.Text, geminiResponse.Images);
+                    else
+                        AddChatBubble(senderLabel, geminiResponse.Text);
+
+                    AddRetryButton();
+                    AutoSaveChatSession();
+                }
             }
         }
         catch (OperationCanceledException) { RemoveTypingIndicator(); }
@@ -153,75 +238,223 @@ public partial class MainWindow
             border.BorderThickness = new Thickness(1);
         }
 
-        // Build the message content — detect code blocks
+        // Build the message content
         var contentPanel = new StackPanel();
-        var segments = SplitCodeBlocks(text);
-        foreach (var (content, isCode) in segments)
+        if (isUser)
         {
-            if (isCode)
+            // User messages: plain text
+            var textBox = new TextBox
             {
-                bool isDark = _appSettings.SelectedTheme != "Light";
-                var codeBlock = new Border
-                {
-                    Background = new SolidColorBrush(isDark ? Color.FromRgb(0x0D, 0x0D, 0x0D) : Color.FromRgb(0xF0, 0xF0, 0xF0)),
-                    CornerRadius = new CornerRadius(8),
-                    Padding = new Thickness(10, 8, 10, 8),
-                    Margin = new Thickness(0, 4, 0, 4)
-                };
-                var codeText = new TextBox
-                {
-                    Text = content.Trim(),
-                    TextWrapping = TextWrapping.Wrap,
-                    FontFamily = new FontFamily("Cascadia Code, Consolas, Courier New"),
-                    FontSize = 12.5,
-                    Foreground = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White,
-                    IsReadOnly = true,
-                    BorderThickness = new Thickness(0),
-                    Background = Brushes.Transparent,
-                    Cursor = Cursors.IBeam,
-                    CaretBrush = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White
-                };
-                codeBlock.Child = codeText;
-                contentPanel.Children.Add(codeBlock);
-            }
-            else if (!string.IsNullOrWhiteSpace(content))
-            {
-                var textBox = new TextBox
-                {
-                    Text = content.Trim(),
-                    TextWrapping = TextWrapping.Wrap,
-                    FontFamily = new FontFamily("Segoe UI Variable Text"),
-                    FontSize = 14,
-                    Foreground = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White,
-                    Margin = new Thickness(0, 2, 0, 2),
-                    IsReadOnly = true,
-                    BorderThickness = new Thickness(0),
-                    Background = Brushes.Transparent,
-                    Cursor = Cursors.IBeam,
-                    CaretBrush = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White
-                };
-                contentPanel.Children.Add(textBox);
-            }
+                Text = text.Trim(),
+                TextWrapping = TextWrapping.Wrap,
+                FontFamily = new FontFamily("Segoe UI Variable Text"),
+                FontSize = 14,
+                Foreground = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White,
+                Margin = new Thickness(0, 2, 0, 2),
+                IsReadOnly = true,
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                Cursor = Cursors.IBeam,
+                CaretBrush = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White
+            };
+            contentPanel.Children.Add(textBox);
+        }
+        else
+        {
+            // AI/System messages: full markdown rendering
+            var rendered = MarkdownRenderer.Render(text, Resources);
+            foreach (var element in rendered)
+                contentPanel.Children.Add(element);
         }
 
+        border.Tag = text;
         border.Child = contentPanel;
+
+        // Context menu: Copy Message (all bubbles) + Retry (AI bubbles only)
+        var bubbleMenu = new ContextMenu();
+        var copyItem = new MenuItem { Header = "Copy Message" };
+        copyItem.Click += (s, e) =>
+        {
+            if (border.Tag is string msg && !string.IsNullOrEmpty(msg))
+                System.Windows.Clipboard.SetText(msg);
+        };
+        bubbleMenu.Items.Add(copyItem);
+
+        if (!isUser && !sender.Equals("System", StringComparison.OrdinalIgnoreCase))
+        {
+            var retryItem = new MenuItem { Header = "Retry" };
+            retryItem.Click += (s, e) =>
+            {
+                // Only allow retry on the most recent AI bubble
+                var lastBubble = GetLastAiBubblePanel();
+                if (lastBubble == outerPanel)
+                    RetryLastMessage();
+            };
+            bubbleMenu.Items.Add(retryItem);
+        }
+        border.ContextMenu = bubbleMenu;
+
         outerPanel.Children.Add(border);
         ChatPanel.Children.Add(outerPanel);
 
-        // Fade-in + slide-up animation
+        // Fade-in + slide-up + scale animation
         if (_appSettings.AnimationsEnabled)
         {
             outerPanel.Opacity = 0;
+            outerPanel.RenderTransformOrigin = new Point(0.5, 0.5);
+            var transformGroup = new TransformGroup();
             var translate = new TranslateTransform(0, 12);
-            outerPanel.RenderTransform = translate;
-            outerPanel.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromSeconds(0.25)));
-            translate.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(12, 0, TimeSpan.FromSeconds(0.25))
-            {
-                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
-            });
+            var scale = new ScaleTransform(0.97, 0.97);
+            transformGroup.Children.Add(translate);
+            transformGroup.Children.Add(scale);
+            outerPanel.RenderTransform = transformGroup;
+
+            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+            var dur = TimeSpan.FromSeconds(0.3);
+            outerPanel.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, dur));
+            translate.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(12, 0, dur) { EasingFunction = ease });
+            scale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(0.97, 1.0, dur) { EasingFunction = ease });
+            scale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(0.97, 1.0, dur) { EasingFunction = ease });
         }
 
         ChatScroll.ScrollToBottom();
+    }
+
+    /// <summary>
+    /// Creates a chat bubble shell for streaming — returns a TextBox to append chunks to,
+    /// and the content panel for later re-rendering with code block formatting.
+    /// </summary>
+    private (TextBox textBox, StackPanel contentPanel) CreateStreamingBubble(string sender)
+    {
+        var outerPanel = new StackPanel
+        {
+            Margin = new Thickness(10, 2, 10, 6),
+            MaxWidth = 520,
+            HorizontalAlignment = HorizontalAlignment.Left
+        };
+
+        var senderLabel = new TextBlock
+        {
+            Text = sender,
+            FontSize = 11,
+            FontWeight = FontWeights.Normal,
+            Foreground = Resources["AccentBrush"] as Brush ?? Brushes.CornflowerBlue,
+            Margin = new Thickness(4, 0, 0, 4),
+            Tag = "StreamingSenderLabel"
+        };
+        outerPanel.Children.Add(senderLabel);
+
+        bool rounded = _appSettings.ChatBubbleStyle != "Square";
+        var border = new Border
+        {
+            CornerRadius = rounded ? new CornerRadius(14, 14, 14, 4) : new CornerRadius(4),
+            Padding = new Thickness(14, 10, 14, 10),
+            Background = Resources["SurfaceBrush"] as Brush ?? Brushes.Black,
+            BorderBrush = Resources["InputBorderBrush"] as Brush ?? Brushes.Gray,
+            BorderThickness = new Thickness(1)
+        };
+
+        var contentPanel = new StackPanel();
+        var streamTextBox = new TextBox
+        {
+            Text = "",
+            TextWrapping = TextWrapping.Wrap,
+            FontFamily = new FontFamily("Segoe UI Variable Text"),
+            FontSize = 14,
+            Foreground = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White,
+            Margin = new Thickness(0, 2, 0, 2),
+            IsReadOnly = true,
+            BorderThickness = new Thickness(0),
+            Background = Brushes.Transparent,
+            Cursor = Cursors.IBeam,
+            CaretBrush = Resources["TextPrimaryBrush"] as Brush ?? Brushes.White
+        };
+        contentPanel.Children.Add(streamTextBox);
+
+        border.Tag = "";
+        border.Child = contentPanel;
+
+        // Context menu (Copy + Retry) — Tag will be updated after finalization
+        var bubbleMenu = new ContextMenu();
+        var copyItem = new MenuItem { Header = "Copy Message" };
+        copyItem.Click += (s, e) =>
+        {
+            if (border.Tag is string msg && !string.IsNullOrEmpty(msg))
+                System.Windows.Clipboard.SetText(msg);
+        };
+        bubbleMenu.Items.Add(copyItem);
+
+        var retryItem = new MenuItem { Header = "Retry" };
+        retryItem.Click += (s, e) =>
+        {
+            var lastBubble = GetLastAiBubblePanel();
+            if (lastBubble == outerPanel)
+                RetryLastMessage();
+        };
+        bubbleMenu.Items.Add(retryItem);
+        border.ContextMenu = bubbleMenu;
+
+        outerPanel.Children.Add(border);
+        ChatPanel.Children.Add(outerPanel);
+
+        if (_appSettings.AnimationsEnabled)
+        {
+            outerPanel.Opacity = 0;
+            outerPanel.RenderTransformOrigin = new Point(0.5, 0.5);
+            var streamTransformGroup = new TransformGroup();
+            var translate = new TranslateTransform(0, 12);
+            var scale = new ScaleTransform(0.97, 0.97);
+            streamTransformGroup.Children.Add(translate);
+            streamTransformGroup.Children.Add(scale);
+            outerPanel.RenderTransform = streamTransformGroup;
+
+            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+            var dur = TimeSpan.FromSeconds(0.3);
+            outerPanel.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, dur));
+            translate.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(12, 0, dur) { EasingFunction = ease });
+            scale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(0.97, 1.0, dur) { EasingFunction = ease });
+            scale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(0.97, 1.0, dur) { EasingFunction = ease });
+        }
+
+        ChatScroll.ScrollToBottom();
+        return (streamTextBox, contentPanel);
+    }
+
+    /// <summary>
+    /// Updates the sender label on a streaming bubble (e.g., to add model name after response).
+    /// </summary>
+    private void UpdateStreamingBubbleSender(StackPanel? contentPanel, string newSender)
+    {
+        if (contentPanel == null) return;
+        // The sender label is in the outer panel (parent of the border that contains contentPanel)
+        var border = contentPanel.Parent as Border;
+        var outerPanel = border?.Parent as StackPanel;
+        if (outerPanel == null) return;
+
+        foreach (var child in outerPanel.Children)
+        {
+            if (child is TextBlock tb && tb.Tag as string == "StreamingSenderLabel")
+            {
+                tb.Text = newSender;
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Re-renders the streaming bubble content with proper code block formatting.
+    /// </summary>
+    private void FinalizeStreamingBubble(StackPanel contentPanel, string fullText)
+    {
+        contentPanel.Children.Clear();
+
+        var rendered = MarkdownRenderer.Render(fullText, Resources);
+        foreach (var element in rendered)
+            contentPanel.Children.Add(element);
+
+        // Update the border's Tag with the full response text for Copy Message
+        if (contentPanel.Parent is Border border)
+            border.Tag = fullText;
     }
 
     /// <summary>
@@ -456,17 +689,25 @@ public partial class MainWindow
             Title = "Attach Images"
         };
 
-        if (dlg.ShowDialog() == true)
+        _isFileDialogOpen = true;
+        try
         {
-            foreach (string file in dlg.FileNames)
+            if (dlg.ShowDialog() == true)
             {
-                if (IsImageFile(file))
+                foreach (string file in dlg.FileNames)
                 {
-                    byte[] data = File.ReadAllBytes(file);
-                    _pendingImages.Add((data, GetMimeType(file), System.IO.Path.GetFileName(file)));
+                    if (IsImageFile(file))
+                    {
+                        byte[] data = File.ReadAllBytes(file);
+                        _pendingImages.Add((data, GetMimeType(file), System.IO.Path.GetFileName(file)));
+                    }
                 }
+                UpdateAttachedImagesUI();
             }
-            UpdateAttachedImagesUI();
+        }
+        finally
+        {
+            _isFileDialogOpen = false;
         }
     }
 
@@ -641,9 +882,9 @@ public partial class MainWindow
             var img = new System.Windows.Controls.Image
             {
                 Source = bmp,
-                MaxWidth = 400,
+                MaxWidth = 480,
                 Stretch = Stretch.Uniform,
-                Margin = new Thickness(0, 6, 0, 4),
+                Margin = new Thickness(0, 6, 0, 2),
                 Cursor = Cursors.Hand
             };
             var imgBorder = new Border
@@ -653,31 +894,74 @@ public partial class MainWindow
                 Child = img
             };
 
-            // Right-click to save
+            // Click-to-zoom: left click shows full-size overlay
+            var capturedBmp = bmp;
+            img.MouseLeftButtonUp += (s, e) =>
+            {
+                ShowImageOverlay(capturedBmp);
+                e.Handled = true;
+            };
+
+            // Right-click to save (kept for backward compat)
             var capturedData = data;
             var capturedMime = mimeType;
             img.MouseRightButtonUp += (s, e) =>
             {
-                string ext = capturedMime switch
-                {
-                    "image/jpeg" => ".jpg",
-                    "image/gif" => ".gif",
-                    "image/webp" => ".webp",
-                    _ => ".png"
-                };
-                var dlg = new Microsoft.Win32.SaveFileDialog
-                {
-                    FileName = $"compass_image{ext}",
-                    Filter = $"Image file|*{ext}|All files|*.*"
-                };
-                if (dlg.ShowDialog() == true)
-                    File.WriteAllBytes(dlg.FileName, capturedData);
+                SaveGeneratedImage(capturedData, capturedMime);
+                e.Handled = true;
             };
 
             contentPanel.Children.Add(imgBorder);
+
+            // Visible "Save Image" button
+            var saveBtn = new Border
+            {
+                Background = Resources["CardBrush"] as Brush,
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(8, 4, 8, 4),
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(0, 2, 0, 4),
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            saveBtn.Child = new TextBlock
+            {
+                Text = "\uD83D\uDCBE Save Image",
+                FontSize = 11,
+                Foreground = Resources["TextSecondaryBrush"] as Brush
+            };
+            var saveCapturedData = data;
+            var saveCapturedMime = mimeType;
+            saveBtn.MouseLeftButtonUp += (s, e) =>
+            {
+                SaveGeneratedImage(saveCapturedData, saveCapturedMime);
+                e.Handled = true;
+            };
+            contentPanel.Children.Add(saveBtn);
         }
 
+        border.Tag = text;
         border.Child = contentPanel;
+
+        // Context menu: Copy Message + Retry
+        var genImgMenu = new ContextMenu();
+        var genCopyItem = new MenuItem { Header = "Copy Message" };
+        genCopyItem.Click += (s, e) =>
+        {
+            if (border.Tag is string msg && !string.IsNullOrEmpty(msg))
+                System.Windows.Clipboard.SetText(msg);
+        };
+        genImgMenu.Items.Add(genCopyItem);
+
+        var genRetryItem = new MenuItem { Header = "Retry" };
+        genRetryItem.Click += (s, e) =>
+        {
+            var lastBubble = GetLastAiBubblePanel();
+            if (lastBubble == outerPanel)
+                RetryLastMessage();
+        };
+        genImgMenu.Items.Add(genRetryItem);
+        border.ContextMenu = genImgMenu;
+
         outerPanel.Children.Add(border);
         ChatPanel.Children.Add(outerPanel);
 
@@ -713,6 +997,107 @@ public partial class MainWindow
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Retry
+    // ---------------------------------------------------------------------------
+
+    private void AddRetryButton()
+    {
+        RemoveRetryButton();
+
+        var retryBorder = new Border
+        {
+            Tag = "RetryButton",
+            Background = Resources["CardBrush"] as Brush ?? Brushes.DarkGray,
+            CornerRadius = new CornerRadius(12),
+            Padding = new Thickness(10, 4, 10, 4),
+            Cursor = Cursors.Hand,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Margin = new Thickness(14, 0, 0, 6)
+        };
+        retryBorder.Child = new TextBlock
+        {
+            Text = "\u21BB Retry",
+            FontSize = 11,
+            Foreground = Resources["TextSecondaryBrush"] as Brush ?? Brushes.LightGray
+        };
+        retryBorder.MouseEnter += (s, e) => retryBorder.Background = Resources["HoverBrush"] as Brush ?? Brushes.Gray;
+        retryBorder.MouseLeave += (s, e) => retryBorder.Background = Resources["CardBrush"] as Brush ?? Brushes.DarkGray;
+        retryBorder.MouseLeftButtonUp += (s, e) =>
+        {
+            RetryLastMessage();
+            e.Handled = true;
+        };
+
+        ChatPanel.Children.Add(retryBorder);
+        ChatScroll.ScrollToBottom();
+    }
+
+    private void RemoveRetryButton()
+    {
+        for (int i = ChatPanel.Children.Count - 1; i >= 0; i--)
+        {
+            if (ChatPanel.Children[i] is Border b && b.Tag as string == "RetryButton")
+            {
+                ChatPanel.Children.RemoveAt(i);
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Finds the outermost StackPanel of the last AI bubble in the chat.
+    /// </summary>
+    private StackPanel? GetLastAiBubblePanel()
+    {
+        for (int i = ChatPanel.Children.Count - 1; i >= 0; i--)
+        {
+            if (ChatPanel.Children[i] is StackPanel sp && sp.HorizontalAlignment == HorizontalAlignment.Left)
+                return sp;
+        }
+        return null;
+    }
+
+    private void RetryLastMessage()
+    {
+        // Find the last user bubble (HorizontalAlignment.Right)
+        string? userText = null;
+        int userIndex = -1;
+        for (int i = ChatPanel.Children.Count - 1; i >= 0; i--)
+        {
+            if (ChatPanel.Children[i] is StackPanel sp && sp.HorizontalAlignment == HorizontalAlignment.Right)
+            {
+                // Extract text from the border's Tag
+                foreach (var child in sp.Children)
+                {
+                    if (child is Border b && b.Tag is string tag && !string.IsNullOrEmpty(tag))
+                    {
+                        userText = tag;
+                        break;
+                    }
+                }
+                userIndex = i;
+                break;
+            }
+        }
+
+        if (userText == null || userIndex < 0) return;
+
+        // Remove retry button, last AI bubble(s), and the user bubble
+        RemoveRetryButton();
+
+        // Remove everything from userIndex onwards (user bubble + AI response)
+        while (ChatPanel.Children.Count > userIndex)
+            ChatPanel.Children.RemoveAt(ChatPanel.Children.Count - 1);
+
+        // Sync API history
+        _geminiService.RemoveLastExchange();
+
+        // Re-add user bubble and re-ask
+        AddChatBubble("You", userText);
+        FireAndForget(AskGeminiAsync(userText), "RetryLastMessage");
+    }
+
     private void AnimateToChatMode()
     {
         HideWidgetPanel();
@@ -720,6 +1105,7 @@ public partial class MainWindow
         ExitChatArrow.Visibility = Visibility.Visible;
         ClearChatBtn.Visibility = Visibility.Visible;
         ExportChatBtn.Visibility = Visibility.Visible;
+        LoadChatBtn.Visibility = Visibility.Visible;
         PinBtn.Visibility = Visibility.Visible;
         ChatScroll.Visibility = Visibility.Visible;
 
@@ -736,6 +1122,7 @@ public partial class MainWindow
         ExitChatArrow.Visibility = Visibility.Collapsed;
         ClearChatBtn.Visibility = Visibility.Collapsed;
         ExportChatBtn.Visibility = Visibility.Collapsed;
+        LoadChatBtn.Visibility = Visibility.Collapsed;
         PinBtn.Visibility = Visibility.Collapsed;
 
         AnimateOrSnap(ChatScale, ScaleTransform.ScaleYProperty, 0, TimeSpan.FromSeconds(0.25),
@@ -744,6 +1131,8 @@ public partial class MainWindow
             {
                 ChatScroll.Visibility = Visibility.Collapsed;
                 UpdateResumeIndicator();
+                if (string.IsNullOrEmpty(InputBox.Text))
+                    ShowWidgetPanel();
             });
     }
 
@@ -772,7 +1161,7 @@ public partial class MainWindow
         _chatCts?.Cancel();
         _geminiService.ClearHistory();
         ChatPanel.Children.Clear();
-        AddChatBubble("System", "Chat history cleared.");
+        _currentChatSessionFile = null;
         UpdateResumeIndicator();
     }
 
@@ -792,24 +1181,32 @@ public partial class MainWindow
             Title = "Export Chat"
         };
 
-        if (dlg.ShowDialog() == true)
+        _isFileDialogOpen = true;
+        try
         {
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine("# Compass Chat Export");
-            sb.AppendLine($"*{DateTime.Now:MMMM d, yyyy h:mm tt}*");
-            sb.AppendLine();
-            sb.AppendLine("---");
-            sb.AppendLine();
-
-            foreach (var (role, text) in history)
+            if (dlg.ShowDialog() == true)
             {
-                sb.AppendLine($"**{role}:**");
-                sb.AppendLine(text);
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("# Compass Chat Export");
+                sb.AppendLine($"*{DateTime.Now:MMMM d, yyyy h:mm tt}*");
                 sb.AppendLine();
-            }
+                sb.AppendLine("---");
+                sb.AppendLine();
 
-            System.IO.File.WriteAllText(dlg.FileName, sb.ToString());
-            AddChatBubble("System", $"Chat exported to {System.IO.Path.GetFileName(dlg.FileName)}");
+                foreach (var (role, text) in history)
+                {
+                    sb.AppendLine($"**{role}:**");
+                    sb.AppendLine(text);
+                    sb.AppendLine();
+                }
+
+                System.IO.File.WriteAllText(dlg.FileName, sb.ToString());
+                AddChatBubble("System", $"Chat exported to {System.IO.Path.GetFileName(dlg.FileName)}");
+            }
+        }
+        finally
+        {
+            _isFileDialogOpen = false;
         }
     }
 
@@ -817,6 +1214,246 @@ public partial class MainWindow
     {
         AnimateToSpotlightMode();
         ExitChatArrow.Visibility = Visibility.Collapsed;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Chat auto-save / load
+    // ---------------------------------------------------------------------------
+
+    private static string ChatSavesFolder => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Compass", "Chats");
+
+    private void AutoSaveChatSession()
+    {
+        if (!_geminiService.HasHistory) return;
+
+        try
+        {
+            Directory.CreateDirectory(ChatSavesFolder);
+
+            // Create a new session file on first save, reuse it for subsequent saves
+            if (string.IsNullOrEmpty(_currentChatSessionFile))
+            {
+                var history = _geminiService.GetExportableHistory();
+                string firstMsg = history.FirstOrDefault(h => h.role == "You").text ?? "Chat";
+                // Truncate and sanitize for filename
+                string label = firstMsg.Length > 50 ? firstMsg[..50] : firstMsg;
+                string safeName = string.Join("_", label.Split(System.IO.Path.GetInvalidFileNameChars()));
+                safeName = safeName.Replace(" ", "-");
+                string timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                _currentChatSessionFile = System.IO.Path.Combine(ChatSavesFolder, $"{timestamp}_{safeName}.json");
+            }
+
+            string json = _geminiService.SerializeHistory();
+            File.WriteAllText(_currentChatSessionFile, json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to auto-save chat session");
+        }
+    }
+
+    private void LoadChatState_Click(object sender, MouseButtonEventArgs e)
+    {
+        BuildSavedChatsPopup();
+        LoadChatPopup.IsOpen = !LoadChatPopup.IsOpen;
+    }
+
+    private void BuildSavedChatsPopup()
+    {
+        SavedChatsPanel.Children.Clear();
+
+        if (!Directory.Exists(ChatSavesFolder))
+        {
+            SavedChatsPanel.Children.Add(new TextBlock
+            {
+                Text = "No saved chats",
+                Foreground = Resources["TextTertiaryBrush"] as Brush,
+                FontSize = 12,
+                Margin = new Thickness(10, 8, 10, 8)
+            });
+            return;
+        }
+
+        var files = Directory.GetFiles(ChatSavesFolder, "*.json")
+            .OrderByDescending(f => File.GetLastWriteTime(f))
+            .ToArray();
+
+        if (files.Length == 0)
+        {
+            SavedChatsPanel.Children.Add(new TextBlock
+            {
+                Text = "No saved chats",
+                Foreground = Resources["TextTertiaryBrush"] as Brush,
+                FontSize = 12,
+                Margin = new Thickness(10, 8, 10, 8)
+            });
+            return;
+        }
+
+        foreach (var file in files)
+        {
+            string name = System.IO.Path.GetFileNameWithoutExtension(file);
+            string date = File.GetLastWriteTime(file).ToString("MMM d, h:mm tt");
+
+            var nameText = new TextBlock
+            {
+                Text = name,
+                FontSize = 12.5,
+                Foreground = Resources["TextPrimaryBrush"] as Brush,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            var dateText = new TextBlock
+            {
+                Text = date,
+                FontSize = 9.5,
+                Foreground = Resources["TextTertiaryBrush"] as Brush,
+                Margin = new Thickness(0, 1, 0, 0)
+            };
+
+            var textStack = new StackPanel();
+            textStack.Children.Add(nameText);
+            textStack.Children.Add(dateText);
+
+            // Delete button
+            var deleteBtn = new TextBlock
+            {
+                Text = "\u2715",
+                FontSize = 12,
+                Foreground = Resources["TextTertiaryBrush"] as Brush,
+                VerticalAlignment = VerticalAlignment.Center,
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(8, 0, 0, 0)
+            };
+
+            var row = new DockPanel();
+            DockPanel.SetDock(deleteBtn, Dock.Right);
+            row.Children.Add(deleteBtn);
+            row.Children.Add(textStack);
+
+            var container = new Border
+            {
+                Padding = new Thickness(10, 6, 10, 6),
+                CornerRadius = new CornerRadius(6),
+                Background = Brushes.Transparent,
+                Cursor = Cursors.Hand,
+                Child = row
+            };
+
+            container.MouseEnter += (s, ev) => container.Background = Resources["HoverBrush"] as Brush ?? Brushes.DarkGray;
+            container.MouseLeave += (s, ev) => container.Background = Brushes.Transparent;
+
+            string capturedFile = file;
+            string capturedName = name;
+            container.MouseLeftButtonUp += (s, ev) =>
+            {
+                LoadChatFromFile(capturedFile, capturedName);
+                LoadChatPopup.IsOpen = false;
+                ev.Handled = true;
+            };
+            deleteBtn.MouseLeftButtonUp += (s, ev) =>
+            {
+                try { File.Delete(capturedFile); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete saved chat: {File}", capturedFile); }
+                BuildSavedChatsPopup(); // rebuild
+                ev.Handled = true;
+            };
+
+            SavedChatsPanel.Children.Add(container);
+        }
+    }
+
+    private void LoadChatFromFile(string filePath, string name)
+    {
+        try
+        {
+            string json = File.ReadAllText(filePath);
+            _geminiService.LoadSerializedHistory(json);
+
+            // Rebuild chat UI from history (with images)
+            ChatPanel.Children.Clear();
+            var history = _geminiService.GetExportableHistoryWithImages();
+            foreach (var (role, text, images) in history)
+            {
+                string sender = role == "You" ? "You" : "Gemini";
+                if (images.Count > 0)
+                    AddChatBubbleWithGeneratedImages(sender, text, images);
+                else
+                    AddChatBubble(sender, text);
+            }
+
+            _currentChatSessionFile = filePath;
+
+            if (ChatScroll.Visibility != Visibility.Visible)
+                AnimateToChatMode();
+        }
+        catch (Exception ex)
+        {
+            AddChatBubble("System", $"Failed to load chat: {ex.Message}");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Image helpers
+    // ---------------------------------------------------------------------------
+
+    private void SaveGeneratedImage(byte[] data, string mimeType)
+    {
+        string ext = mimeType switch
+        {
+            "image/jpeg" => ".jpg",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            _ => ".png"
+        };
+        var dlg = new Microsoft.Win32.SaveFileDialog
+        {
+            FileName = $"compass_image{ext}",
+            Filter = $"Image file|*{ext}|All files|*.*"
+        };
+        _isFileDialogOpen = true;
+        try
+        {
+            if (dlg.ShowDialog() == true)
+                File.WriteAllBytes(dlg.FileName, data);
+        }
+        finally
+        {
+            _isFileDialogOpen = false;
+        }
+    }
+
+    private void ShowImageOverlay(BitmapImage image)
+    {
+        var overlay = new Grid
+        {
+            Background = new SolidColorBrush(Color.FromArgb(200, 0, 0, 0)),
+            Cursor = Cursors.Hand
+        };
+
+        var img = new System.Windows.Controls.Image
+        {
+            Source = image,
+            Stretch = Stretch.Uniform,
+            MaxWidth = SystemParameters.PrimaryScreenWidth * 0.8,
+            MaxHeight = SystemParameters.PrimaryScreenHeight * 0.8,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(20)
+        };
+        overlay.Children.Add(img);
+
+        // Dismiss on click anywhere
+        overlay.MouseLeftButtonUp += (s, e) =>
+        {
+            var parent = overlay.Parent as Panel;
+            parent?.Children.Remove(overlay);
+        };
+
+        // Add overlay on top of the main grid
+        if (Content is Grid mainGrid)
+            mainGrid.Children.Add(overlay);
     }
 
 }

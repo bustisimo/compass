@@ -114,6 +114,16 @@ public class WidgetService : IWidgetService
                 BuiltInType = "Media",
                 RefreshIntervalSeconds = 3,
                 WidgetSize = "1x1"
+            },
+            new CompassWidget
+            {
+                Id = "builtin-notes",
+                Name = "Notes",
+                Description = "Quick notes and scratchpad",
+                IsBuiltIn = true,
+                BuiltInType = "Notes",
+                RefreshIntervalSeconds = 0,
+                WidgetSize = "2x1"
             }
         };
     }

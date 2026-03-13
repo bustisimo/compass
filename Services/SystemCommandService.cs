@@ -83,6 +83,36 @@ public class SystemCommandService : ISystemCommandService
     public void VolumeDown() => SendKey(VK_VOLUME_DOWN);
     public void VolumeMute() => SendKey(VK_VOLUME_MUTE);
 
+    public float GetMasterVolume()
+    {
+        try
+        {
+            var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+            enumerator.GetDefaultAudioEndpoint(0, 1, out var device);
+            var iid = typeof(IAudioEndpointVolume).GUID;
+            device.Activate(ref iid, 1, IntPtr.Zero, out var obj);
+            var volume = (IAudioEndpointVolume)obj;
+            volume.GetMasterVolumeLevelScalar(out float level);
+            return level;
+        }
+        catch { return 0.5f; }
+    }
+
+    public void SetMasterVolume(float level)
+    {
+        try
+        {
+            var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+            enumerator.GetDefaultAudioEndpoint(0, 1, out var device);
+            var iid = typeof(IAudioEndpointVolume).GUID;
+            device.Activate(ref iid, 1, IntPtr.Zero, out var obj);
+            var volume = (IAudioEndpointVolume)obj;
+            var guid = Guid.Empty;
+            volume.SetMasterVolumeLevelScalar(Math.Clamp(level, 0f, 1f), ref guid);
+        }
+        catch { }
+    }
+
     // --- Window management ---
 
     public void MinimizeActiveWindow()
@@ -243,4 +273,34 @@ public class SystemCommandService : ISystemCommandService
 
         return string.IsNullOrWhiteSpace(error) ? output.Trim() : $"Error: {error.Trim()}";
     }
+}
+
+// --- Windows Core Audio COM interop (minimal) ---
+
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+internal class MMDeviceEnumeratorComObject { }
+
+[ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMMDeviceEnumerator
+{
+    int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
+    int GetDefaultAudioEndpoint(int dataFlow, int role, [MarshalAs(UnmanagedType.Interface)] out IMMDevice ppEndpoint);
+}
+
+[ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMMDevice
+{
+    int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+}
+
+[ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IAudioEndpointVolume
+{
+    int RegisterControlChangeNotify(IntPtr pNotify);
+    int UnregisterControlChangeNotify(IntPtr pNotify);
+    int GetChannelCount(out uint pnChannelCount);
+    int SetMasterVolumeLevel(float fLevelDB, ref Guid pguidEventContext);
+    int SetMasterVolumeLevelScalar(float fLevel, ref Guid pguidEventContext);
+    int GetMasterVolumeLevel(out float pfLevelDB);
+    int GetMasterVolumeLevelScalar(out float pfLevel);
 }

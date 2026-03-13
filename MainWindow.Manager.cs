@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 using Compass.Services.Interfaces;
 using Microsoft.Extensions.Logging;
@@ -28,7 +30,6 @@ public partial class MainWindow
         UpdateEmptyStates();
         ApiKeyBox.Password = _appSettings.ApiKey;
         StartupCheck.IsChecked = _appSettings.LaunchAtStartup;
-        RandomGreetingsCheck.IsChecked = _appSettings.RandomGreetingsEnabled;
         OpacitySlider.Value = _appSettings.WindowOpacity;
         SystemPromptBox.Text = _appSettings.SystemPrompt;
         RefreshModelList();
@@ -73,6 +74,43 @@ public partial class MainWindow
         ModelComboBox.SelectedItem = _appSettings.SelectedModel;
     }
 
+    // Curated model lists with marketing names
+    private static readonly List<ImageModelOption> _imageModelOptions = new()
+    {
+        new("Nano Banana", "gemini-2.5-flash-image"),
+        new("Nano Banana Pro", "gemini-3-pro-image-preview"),
+        new("Nano Banana 2", "gemini-3.1-flash-image-preview"),
+    };
+
+    private static readonly Dictionary<string, string> _chatModelDisplayNames = new()
+    {
+        { "gemini-2.5-flash", "Gemini 2.5 Flash" },
+        { "gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite" },
+        { "gemini-2.5-pro", "Gemini 2.5 Pro" },
+        { "gemini-3-flash-preview", "Gemini 3 Flash" },
+        { "gemini-3.1-pro-preview", "Gemini 3.1 Pro" },
+        { "gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash-Lite" },
+    };
+
+    private static string GetChatModelDisplayName(string modelId)
+    {
+        return _chatModelDisplayNames.TryGetValue(modelId, out var name) ? name : modelId;
+    }
+
+    private static string GetShortModelLabel(string modelId)
+    {
+        return modelId switch
+        {
+            "gemini-2.5-flash" => "2.5 Flash",
+            "gemini-2.5-flash-lite" => "2.5 Flash-Lite",
+            "gemini-2.5-pro" => "2.5 Pro",
+            "gemini-3-flash-preview" => "3 Flash",
+            "gemini-3.1-pro-preview" => "3.1 Pro",
+            "gemini-3.1-flash-lite-preview" => "3.1 Flash-Lite",
+            _ => modelId.Replace("gemini-", "").Replace("-preview", "")
+        };
+    }
+
     private void RefreshRoutingModelLists()
     {
         FastModelComboBox.ItemsSource = null;
@@ -82,6 +120,22 @@ public partial class MainWindow
         PowerModelComboBox.ItemsSource = null;
         PowerModelComboBox.ItemsSource = _appSettings.AvailableModels;
         PowerModelComboBox.SelectedItem = _appSettings.PowerModel;
+
+        RefreshImageModelList();
+    }
+
+    private void RefreshImageModelList()
+    {
+        ImageModelComboBox.ItemsSource = null;
+        ImageModelComboBox.ItemsSource = _imageModelOptions;
+        ImageModelComboBox.SelectedValue = _appSettings.ImageGenerationModel;
+
+        // If current model isn't in the curated list, select the first option
+        if (ImageModelComboBox.SelectedValue == null && _imageModelOptions.Count > 0)
+        {
+            ImageModelComboBox.SelectedIndex = 0;
+            _appSettings.ImageGenerationModel = _imageModelOptions[0].ModelId;
+        }
     }
 
     private async Task FetchAvailableModelsAsync()
@@ -106,7 +160,6 @@ public partial class MainWindow
                     _appSettings.FastModel = models.FirstOrDefault(m => m.Contains("flash-lite")) ?? _appSettings.SelectedModel;
                 if (!models.Contains(_appSettings.PowerModel))
                     _appSettings.PowerModel = models.FirstOrDefault(m => m.Contains("2.5-flash") || m.Contains("pro")) ?? _appSettings.SelectedModel;
-
                 RefreshModelList();
                 RefreshRoutingModelLists();
                 SaveSettings();
@@ -250,6 +303,18 @@ public partial class MainWindow
         }
     }
 
+    private void ApiKeyBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        _appSettings.ApiKey = ApiKeyBox.Password;
+        SaveSettings();
+    }
+
+    private void SystemPromptBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        _appSettings.SystemPrompt = SystemPromptBox.Text;
+        SaveSettings();
+    }
+
     private void StartupCheck_Changed(object sender, RoutedEventArgs e)
     {
         _appSettings.LaunchAtStartup = StartupCheck.IsChecked == true;
@@ -273,7 +338,8 @@ public partial class MainWindow
 
     private void RandomGreetingsCheck_Changed(object sender, RoutedEventArgs e)
     {
-        _appSettings.RandomGreetingsEnabled = RandomGreetingsCheck.IsChecked == true;
+        if (sender is System.Windows.Controls.CheckBox cb)
+            _appSettings.RandomGreetingsEnabled = cb.IsChecked == true;
         SaveSettings();
     }
 
@@ -326,4 +392,290 @@ public partial class MainWindow
         }
     }
 
+    private void ImageModelComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ImageModelComboBox.SelectedValue is string modelId)
+        {
+            _appSettings.ImageGenerationModel = modelId;
+            SaveSettings();
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Chat bar model picker
+    // ---------------------------------------------------------------------------
+
+    private bool _suppressModelPickerOpen;
+
+    private void EllipsisMenu_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (_suppressModelPickerOpen)
+            return;
+
+        BuildModelPickerPopup();
+        ModelPickerPopup.IsOpen = true;
+        e.Handled = true;
+    }
+
+    private void ModelPickerPopup_Closed(object? sender, EventArgs e)
+    {
+        _suppressModelPickerOpen = true;
+        Dispatcher.BeginInvoke(() => _suppressModelPickerOpen = false);
+    }
+
+    private void ChatsBtn_Click(object sender, MouseButtonEventArgs e)
+    {
+        ShowSavedChatsAsResults();
+    }
+
+    private void UpdateModelSelectorLabel()
+    {
+        // No longer needed as standalone label — kept for settings sync
+    }
+
+    private void BuildModelPickerPopup()
+    {
+        ModelPickerPanel.Children.Clear();
+
+        // --- Image Generation Toggle ---
+        var toggleRow = new DockPanel { Margin = new Thickness(10, 8, 10, 4) };
+        var toggleLabel = new StackPanel();
+        toggleLabel.Children.Add(new TextBlock
+        {
+            Text = "Image Generation",
+            FontSize = 12.5,
+            Foreground = Resources["TextPrimaryBrush"] as Brush,
+            FontWeight = FontWeights.SemiBold
+        });
+        toggleLabel.Children.Add(new TextBlock
+        {
+            Text = _imageGenModeEnabled ? "Always generate images" : "Auto-detect from prompt",
+            FontSize = 9.5,
+            Foreground = Resources["TextTertiaryBrush"] as Brush,
+            Margin = new Thickness(0, 1, 0, 0)
+        });
+
+        var toggleSwitch = new CheckBox
+        {
+            IsChecked = _imageGenModeEnabled,
+            VerticalAlignment = VerticalAlignment.Center,
+            Style = Resources["ToggleSwitchStyle"] as Style
+        };
+        toggleSwitch.Checked += (s, ev) =>
+        {
+            _imageGenModeEnabled = true;
+            BuildModelPickerPopup(); // rebuild to update subtitle
+        };
+        toggleSwitch.Unchecked += (s, ev) =>
+        {
+            _imageGenModeEnabled = false;
+            BuildModelPickerPopup();
+        };
+
+        DockPanel.SetDock(toggleSwitch, Dock.Right);
+        toggleRow.Children.Add(toggleSwitch);
+        toggleRow.Children.Add(toggleLabel);
+        ModelPickerPanel.Children.Add(toggleRow);
+
+        // --- Separator ---
+        ModelPickerPanel.Children.Add(new Border
+        {
+            Height = 1,
+            Background = Resources["InputBorderBrush"] as Brush,
+            Margin = new Thickness(8, 6, 8, 6)
+        });
+
+        // Partition chat models into flagship (has display name) and other
+        var flagshipModels = new List<string>();
+        var otherModels = new List<string>();
+
+        foreach (var modelId in _appSettings.AvailableModels)
+        {
+            if (modelId.Contains("-image")) continue; // skip image models from chat list
+            if (_chatModelDisplayNames.ContainsKey(modelId))
+                flagshipModels.Add(modelId);
+            else
+                otherModels.Add(modelId);
+        }
+
+        // --- Chat Models section ---
+        AddSectionHeader("CHAT MODEL");
+
+        foreach (var modelId in flagshipModels)
+        {
+            string displayName = _chatModelDisplayNames[modelId];
+            bool isSelected = modelId == _appSettings.SelectedModel;
+            AddModelItem(displayName, modelId, isSelected, () =>
+            {
+                _appSettings.SelectedModel = modelId;
+                SaveSettings();
+                RefreshModelList();
+                UpdateModelSelectorLabel();
+                ModelPickerPopup.IsOpen = false;
+            });
+        }
+
+        // --- Other Models (collapsed by default) ---
+        if (otherModels.Count > 0)
+        {
+            var otherPanel = new StackPanel { Visibility = Visibility.Collapsed };
+
+            foreach (var modelId in otherModels)
+            {
+                bool isSelected = modelId == _appSettings.SelectedModel;
+                var item = CreateModelPickerItem(modelId, modelId, isSelected, () =>
+                {
+                    _appSettings.SelectedModel = modelId;
+                    SaveSettings();
+                    RefreshModelList();
+                    UpdateModelSelectorLabel();
+                    ModelPickerPopup.IsOpen = false;
+                });
+                otherPanel.Children.Add(item);
+            }
+
+            // If current model is in "other", expand by default
+            bool currentInOther = otherModels.Contains(_appSettings.SelectedModel);
+            if (currentInOther) otherPanel.Visibility = Visibility.Visible;
+
+            var toggleText = new TextBlock
+            {
+                Text = currentInOther ? "Hide other models" : $"Other models ({otherModels.Count})",
+                FontSize = 10.5,
+                Foreground = Resources["AccentBrush"] as Brush ?? Brushes.CornflowerBlue,
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(10, 6, 10, 2)
+            };
+            toggleText.MouseLeftButtonUp += (s, e) =>
+            {
+                if (otherPanel.Visibility == Visibility.Visible)
+                {
+                    otherPanel.Visibility = Visibility.Collapsed;
+                    toggleText.Text = $"Other models ({otherModels.Count})";
+                }
+                else
+                {
+                    otherPanel.Visibility = Visibility.Visible;
+                    toggleText.Text = "Hide other models";
+                }
+                e.Handled = true;
+            };
+
+            ModelPickerPanel.Children.Add(toggleText);
+            ModelPickerPanel.Children.Add(otherPanel);
+        }
+
+        // --- Separator ---
+        ModelPickerPanel.Children.Add(new Border
+        {
+            Height = 1,
+            Background = Resources["InputBorderBrush"] as Brush,
+            Margin = new Thickness(8, 6, 8, 6)
+        });
+
+        // --- Image Models section ---
+        AddSectionHeader("IMAGE MODEL");
+
+        foreach (var option in _imageModelOptions)
+        {
+            bool isSelected = option.ModelId == _appSettings.ImageGenerationModel;
+            AddModelItem(option.DisplayName, option.ModelId, isSelected, () =>
+            {
+                _appSettings.ImageGenerationModel = option.ModelId;
+                SaveSettings();
+                RefreshImageModelList();
+                ModelPickerPopup.IsOpen = false;
+            });
+        }
+    }
+
+    private void AddSectionHeader(string text)
+    {
+        ModelPickerPanel.Children.Add(new TextBlock
+        {
+            Text = text,
+            FontSize = 10,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = Resources["TextTertiaryBrush"] as Brush,
+            Margin = new Thickness(10, 6, 10, 4)
+        });
+    }
+
+    private void AddModelItem(string displayName, string modelId, bool isSelected, Action onClick)
+    {
+        ModelPickerPanel.Children.Add(CreateModelPickerItem(displayName, modelId, isSelected, onClick));
+    }
+
+    private Border CreateModelPickerItem(string displayName, string modelId, bool isSelected, Action onClick)
+    {
+        var label = new TextBlock
+        {
+            Text = displayName,
+            FontSize = 12.5,
+            FontWeight = isSelected ? FontWeights.SemiBold : FontWeights.Normal,
+            Foreground = isSelected
+                ? (Resources["AccentBrush"] as Brush ?? Brushes.CornflowerBlue)
+                : (Resources["TextPrimaryBrush"] as Brush ?? Brushes.White)
+        };
+
+        var subtitle = new TextBlock
+        {
+            Text = modelId,
+            FontSize = 9.5,
+            Foreground = Resources["TextTertiaryBrush"] as Brush,
+            Margin = new Thickness(0, 1, 0, 0)
+        };
+
+        // Check mark for selected item
+        var checkMark = new TextBlock
+        {
+            Text = "\u2713",
+            FontSize = 13,
+            Foreground = Resources["AccentBrush"] as Brush ?? Brushes.CornflowerBlue,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 6, 0),
+            Visibility = isSelected ? Visibility.Visible : Visibility.Collapsed
+        };
+
+        var textStack = new StackPanel();
+        textStack.Children.Add(label);
+        textStack.Children.Add(subtitle);
+
+        var row = new DockPanel();
+        DockPanel.SetDock(checkMark, Dock.Left);
+        row.Children.Add(checkMark);
+        row.Children.Add(textStack);
+
+        var container = new Border
+        {
+            Padding = new Thickness(8, 5, 10, 5),
+            CornerRadius = new CornerRadius(6),
+            Background = isSelected
+                ? new SolidColorBrush(Color.FromArgb(20, 76, 194, 255))
+                : Brushes.Transparent,
+            Cursor = Cursors.Hand,
+            Child = row
+        };
+
+        container.MouseEnter += (s, e) =>
+        {
+            if (!isSelected)
+                container.Background = Resources["HoverBrush"] as Brush ?? Brushes.DarkGray;
+        };
+        container.MouseLeave += (s, e) =>
+        {
+            if (!isSelected)
+                container.Background = Brushes.Transparent;
+        };
+        container.MouseLeftButtonUp += (s, e) =>
+        {
+            onClick();
+            e.Handled = true;
+        };
+
+        return container;
+    }
+
 }
+
+public record ImageModelOption(string DisplayName, string ModelId);

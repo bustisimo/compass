@@ -5,6 +5,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using Compass.Services;
 using Compass.Services.Interfaces;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
@@ -67,6 +68,22 @@ public partial class MainWindow
             return;
         }
 
+        // Delete key: delete selected chat history result
+        if (e.Key == Key.Delete)
+        {
+            if (SearchResultList.Visibility == Visibility.Visible &&
+                SearchResultList.SelectedItem is AppSearchResult delResult &&
+                delResult.ResultType == ResultType.ChatHistory)
+            {
+                string chatPath = delResult.FilePath["CHAT:".Length..];
+                try { File.Delete(chatPath); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete saved chat: {File}", chatPath); }
+                ShowSavedChatsAsResults();
+                e.Handled = true;
+                return;
+            }
+        }
+
         // Down / Ctrl+N: navigate results or widgets down
         if (e.Key == Key.Down || (e.Key == Key.N && Keyboard.Modifiers == ModifierKeys.Control))
         {
@@ -97,7 +114,8 @@ public partial class MainWindow
 
         if (e.Key == Key.Enter)
         {
-            if (SearchResultList.Visibility == Visibility.Visible && SearchResultList.Items.Count > 0)
+            // If images are attached, skip search result dispatch — always go to chat
+            if (_pendingImages.Count == 0 && SearchResultList.Visibility == Visibility.Visible && SearchResultList.Items.Count > 0)
             {
                 var selectedItem = (AppSearchResult)(SearchResultList.SelectedItem ?? SearchResultList.Items[0]);
                 LaunchApp(selectedItem);
@@ -193,13 +211,16 @@ public partial class MainWindow
 
         HideWidgetPanel();
 
-        // "/" prefix: command mode — show only extension commands
+        // "/" prefix: command palette — quick actions + extension commands
         if (query.StartsWith("/"))
         {
-            var cmdResults = _searchService.SearchCommands(query.Length > 1 ? query[1..] : "");
-            if (cmdResults.Any())
+            string filter = query.Length > 1 ? query[1..] : "";
+            var quickActions = _quickActionsService.Search(filter);
+            var cmdResults = _searchService.SearchCommands(filter);
+            var merged = quickActions.Concat(cmdResults).ToList();
+            if (merged.Any())
             {
-                SearchResultList.ItemsSource = cmdResults;
+                SearchResultList.ItemsSource = merged;
                 ShowSearchList();
                 SearchResultList.SelectedIndex = 0;
             }
@@ -214,6 +235,14 @@ public partial class MainWindow
         if (query.Equals("clipboard", StringComparison.OrdinalIgnoreCase))
         {
             ShowClipboardPanel();
+            return;
+        }
+
+        // "chats" keyword — show saved chat sessions
+        if (query.Equals("chats", StringComparison.OrdinalIgnoreCase) ||
+            query.Equals("chat history", StringComparison.OrdinalIgnoreCase))
+        {
+            ShowSavedChatsAsResults();
             return;
         }
 
@@ -287,6 +316,8 @@ public partial class MainWindow
 
     private async void LaunchApp(AppSearchResult selectedItem)
     {
+        if (string.IsNullOrEmpty(selectedItem.FilePath)) return;
+
         if (selectedItem.FilePath == "MATH")
         {
             System.Windows.Clipboard.SetText(selectedItem.AppName);
@@ -319,6 +350,15 @@ public partial class MainWindow
                 AnimateToChatMode();
                 return;
             }
+            if (selectedItem.FilePath is "COMMAND:CLEAR_CHAT" or "COMMAND:NEW_CHAT")
+            {
+                ChatPanel.Children.Clear();
+                _geminiService.ClearHistory();
+                InputBox.Clear();
+                SearchResultList.Visibility = Visibility.Collapsed;
+                AnimateToSpotlightMode();
+                return;
+            }
             ExecuteSystemCommand(selectedItem.FilePath);
             InputBox.Clear();
             this.Hide();
@@ -340,6 +380,15 @@ public partial class MainWindow
             }
             this.Hide();
             InputBox.Clear();
+            return;
+        }
+
+        if (selectedItem.FilePath.StartsWith("CHAT:"))
+        {
+            string chatFile = selectedItem.FilePath["CHAT:".Length..];
+            InputBox.Clear();
+            SearchResultList.Visibility = Visibility.Collapsed;
+            LoadChatFromFile(chatFile, selectedItem.AppName);
             return;
         }
 
@@ -521,6 +570,264 @@ public partial class MainWindow
     }
 
     // ---------------------------------------------------------------------------
+    // Search preview panel
+    // ---------------------------------------------------------------------------
+
+    private void SearchResultList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SearchResultList.SelectedItem is not AppSearchResult result)
+        {
+            SearchPreviewPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        PreviewContent.Children.Clear();
+        bool hasPreview = false;
+
+        switch (result.ResultType)
+        {
+            case ResultType.Application:
+                {
+                    var nameText = new TextBlock
+                    {
+                        Text = result.AppName,
+                        FontSize = 14,
+                        FontWeight = FontWeights.SemiBold,
+                        Foreground = FindResource("TextPrimaryBrush") as Brush,
+                        TextTrimming = TextTrimming.CharacterEllipsis
+                    };
+                    PreviewContent.Children.Add(nameText);
+
+                    if (!string.IsNullOrEmpty(result.FilePath) && !result.FilePath.StartsWith("COMMAND:"))
+                    {
+                        var pathText = new TextBlock
+                        {
+                            Text = result.FilePath,
+                            FontSize = 11,
+                            Foreground = FindResource("TextTertiaryBrush") as Brush,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                            Margin = new Thickness(0, 4, 0, 0)
+                        };
+                        PreviewContent.Children.Add(pathText);
+
+                        try
+                        {
+                            if (File.Exists(result.FilePath))
+                            {
+                                var fi = new FileInfo(result.FilePath);
+                                var metaText = new TextBlock
+                                {
+                                    Text = $"Size: {FormatFileSize(fi.Length)}  |  Modified: {fi.LastWriteTime:MMM d, yyyy h:mm tt}",
+                                    FontSize = 11,
+                                    Foreground = FindResource("TextTertiaryBrush") as Brush,
+                                    Margin = new Thickness(0, 2, 0, 0)
+                                };
+                                PreviewContent.Children.Add(metaText);
+                            }
+                        }
+                        catch { }
+                    }
+                    hasPreview = true;
+                }
+                break;
+
+            case ResultType.File:
+            case ResultType.RecentFile:
+                {
+                    var nameText = new TextBlock
+                    {
+                        Text = result.AppName,
+                        FontSize = 14,
+                        FontWeight = FontWeights.SemiBold,
+                        Foreground = FindResource("TextPrimaryBrush") as Brush,
+                        TextTrimming = TextTrimming.CharacterEllipsis
+                    };
+                    PreviewContent.Children.Add(nameText);
+
+                    if (!string.IsNullOrEmpty(result.FilePath))
+                    {
+                        var pathText = new TextBlock
+                        {
+                            Text = result.FilePath,
+                            FontSize = 11,
+                            Foreground = FindResource("TextTertiaryBrush") as Brush,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                            Margin = new Thickness(0, 4, 0, 0)
+                        };
+                        PreviewContent.Children.Add(pathText);
+
+                        try
+                        {
+                            if (File.Exists(result.FilePath))
+                            {
+                                var fi = new FileInfo(result.FilePath);
+                                var metaText = new TextBlock
+                                {
+                                    Text = $"Size: {FormatFileSize(fi.Length)}  |  Modified: {fi.LastWriteTime:MMM d, yyyy h:mm tt}",
+                                    FontSize = 11,
+                                    Foreground = FindResource("TextTertiaryBrush") as Brush,
+                                    Margin = new Thickness(0, 2, 0, 0)
+                                };
+                                PreviewContent.Children.Add(metaText);
+                            }
+                        }
+                        catch { }
+                    }
+                    hasPreview = true;
+                }
+                break;
+
+            case ResultType.ClipboardHistory:
+                {
+                    var contentText = new TextBox
+                    {
+                        Text = result.PreviewContent ?? result.AppName,
+                        FontSize = 12,
+                        Foreground = FindResource("TextSecondaryBrush") as Brush,
+                        Background = Brushes.Transparent,
+                        BorderThickness = new Thickness(0),
+                        TextWrapping = TextWrapping.Wrap,
+                        IsReadOnly = true,
+                        MaxHeight = 120,
+                        VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+                    };
+                    PreviewContent.Children.Add(contentText);
+                    hasPreview = true;
+                }
+                break;
+
+            case ResultType.Bookmark:
+                {
+                    var titleText = new TextBlock
+                    {
+                        Text = result.AppName,
+                        FontSize = 14,
+                        FontWeight = FontWeights.SemiBold,
+                        Foreground = FindResource("TextPrimaryBrush") as Brush,
+                        TextTrimming = TextTrimming.CharacterEllipsis
+                    };
+                    PreviewContent.Children.Add(titleText);
+
+                    if (!string.IsNullOrEmpty(result.FilePath))
+                    {
+                        string url = result.FilePath.StartsWith("BOOKMARK:") ? result.FilePath["BOOKMARK:".Length..] : result.FilePath;
+                        var urlText = new TextBlock
+                        {
+                            Text = url,
+                            FontSize = 11,
+                            Foreground = FindResource("AccentBrush") as Brush,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                            Margin = new Thickness(0, 4, 0, 0)
+                        };
+                        PreviewContent.Children.Add(urlText);
+                    }
+                    hasPreview = true;
+                }
+                break;
+
+            case ResultType.Snippet:
+                {
+                    var kwText = new TextBlock
+                    {
+                        Text = result.AppName,
+                        FontSize = 14,
+                        FontWeight = FontWeights.SemiBold,
+                        Foreground = FindResource("TextPrimaryBrush") as Brush
+                    };
+                    PreviewContent.Children.Add(kwText);
+
+                    if (!string.IsNullOrEmpty(result.PreviewContent))
+                    {
+                        var contentText = new TextBox
+                        {
+                            Text = result.PreviewContent,
+                            FontSize = 12,
+                            Foreground = FindResource("TextSecondaryBrush") as Brush,
+                            Background = Brushes.Transparent,
+                            BorderThickness = new Thickness(0),
+                            TextWrapping = TextWrapping.Wrap,
+                            IsReadOnly = true,
+                            MaxHeight = 100,
+                            Margin = new Thickness(0, 4, 0, 0)
+                        };
+                        PreviewContent.Children.Add(contentText);
+                    }
+                    hasPreview = true;
+                }
+                break;
+        }
+
+        if (hasPreview)
+        {
+            SearchPreviewPanel.Visibility = Visibility.Visible;
+            if (_appSettings.AnimationsEnabled)
+            {
+                SearchPreviewPanel.Opacity = 0;
+                SearchPreviewPanel.BeginAnimation(UIElement.OpacityProperty,
+                    new DoubleAnimation(0, 1, TimeSpan.FromSeconds(0.15)));
+            }
+        }
+        else
+        {
+            SearchPreviewPanel.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private static string FormatFileSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
+        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
+    }
+
+    // ---------------------------------------------------------------------------
+    // Search bar focus glow
+    // ---------------------------------------------------------------------------
+
+    private void InputBox_GotFocus(object sender, RoutedEventArgs e)
+    {
+        if (!_appSettings.AnimationsEnabled) return;
+        var accentBrush = FindResource("AccentBrush") as SolidColorBrush;
+        if (accentBrush == null) return;
+        var glowColor = accentBrush.Color;
+        var anim = new ColorAnimation(
+            Color.FromArgb(0x60, glowColor.R, glowColor.G, glowColor.B),
+            TimeSpan.FromSeconds(0.25))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+        };
+        var brush = new SolidColorBrush();
+        brush.BeginAnimation(SolidColorBrush.ColorProperty, anim);
+        SearchBarBorder.BorderBrush = brush;
+        SearchBarBorder.BorderThickness = new Thickness(1.5);
+    }
+
+    private void InputBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (!_appSettings.AnimationsEnabled)
+        {
+            SearchBarBorder.BorderBrush = Brushes.Transparent;
+            SearchBarBorder.BorderThickness = new Thickness(0);
+            return;
+        }
+        var anim = new ColorAnimation(
+            Colors.Transparent,
+            TimeSpan.FromSeconds(0.2))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn }
+        };
+        var brush = SearchBarBorder.BorderBrush as SolidColorBrush;
+        if (brush == null || brush.IsFrozen)
+        {
+            brush = new SolidColorBrush();
+            SearchBarBorder.BorderBrush = brush;
+        }
+        brush.BeginAnimation(SolidColorBrush.ColorProperty, anim);
+        SearchBarBorder.BorderThickness = new Thickness(1.5);
+    }
+
+    // ---------------------------------------------------------------------------
     // Search list animations
     // ---------------------------------------------------------------------------
 
@@ -562,9 +869,55 @@ public partial class MainWindow
 
     private void HideSearchList()
     {
+        SearchPreviewPanel.Visibility = Visibility.Collapsed;
         if (SearchScale.ScaleY == 0) return;
         AnimateOrSnap(SearchScale, ScaleTransform.ScaleYProperty, 0, TimeSpan.FromSeconds(0.2),
             new CubicEase { EasingMode = EasingMode.EaseIn },
             () => SearchResultList.Visibility = Visibility.Collapsed);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Saved chats as search results
+    // ---------------------------------------------------------------------------
+
+    private void ShowSavedChatsAsResults()
+    {
+        var chatIcon = Geometry.Parse("M20,2H4A2,2 0 0,0 2,4V22L6,18H20A2,2 0 0,0 22,16V4A2,2 0 0,0 20,2Z");
+        var results = new List<AppSearchResult>();
+
+        if (Directory.Exists(ChatSavesFolder))
+        {
+            var files = Directory.GetFiles(ChatSavesFolder, "*.json")
+                .OrderByDescending(f => File.GetLastWriteTime(f))
+                .Take(10)
+                .ToArray();
+
+            foreach (var file in files)
+            {
+                string rawName = System.IO.Path.GetFileNameWithoutExtension(file);
+                // Strip timestamp prefix (yyyyMMdd-HHmmss_)
+                string displayName = rawName;
+                if (rawName.Length > 16 && rawName[8] == '-' && rawName[15] == '_')
+                    displayName = rawName[16..].Replace("-", " ").Replace("_", " ");
+
+                string date = File.GetLastWriteTime(file).ToString("MMM d, h:mm tt");
+
+                results.Add(new AppSearchResult
+                {
+                    AppName = displayName,
+                    FilePath = $"CHAT:{file}",
+                    GeometryIcon = chatIcon,
+                    Subtitle = $"{date}  \u2022  Press Del to delete",
+                    ResultType = ResultType.ChatHistory
+                });
+            }
+        }
+
+        if (results.Count == 0)
+            return; // No saved chats — do nothing
+
+        SearchResultList.ItemsSource = results;
+        ShowSearchList();
+        SearchResultList.SelectedIndex = 0;
     }
 }

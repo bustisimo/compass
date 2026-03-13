@@ -1,7 +1,9 @@
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Compass.Services.Interfaces;
 using Microsoft.Extensions.Logging;
@@ -123,6 +125,36 @@ public partial class MainWindow
                     }
                     break;
 
+                case "Image":
+                    if (!string.IsNullOrEmpty(_appSettings.BackgroundImagePath) &&
+                        File.Exists(_appSettings.BackgroundImagePath))
+                    {
+                        try
+                        {
+                            var bmp = new BitmapImage();
+                            bmp.BeginInit();
+                            bmp.UriSource = new Uri(_appSettings.BackgroundImagePath, UriKind.Absolute);
+                            bmp.CacheOption = BitmapCacheOption.OnLoad;
+                            bmp.EndInit();
+                            bmp.Freeze();
+                            MainBorder.Background = new ImageBrush(bmp)
+                            {
+                                Stretch = Stretch.UniformToFill,
+                                Opacity = _appSettings.BackgroundImageOpacity
+                            };
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to load background image: {Path}", _appSettings.BackgroundImagePath);
+                            MainBorder.Background = new SolidColorBrush(Color.FromArgb(opacityByte, primaryColor.R, primaryColor.G, primaryColor.B));
+                        }
+                    }
+                    else
+                    {
+                        MainBorder.Background = new SolidColorBrush(Color.FromArgb(opacityByte, primaryColor.R, primaryColor.G, primaryColor.B));
+                    }
+                    break;
+
                 default: // "Solid"
                     MainBorder.Background = new SolidColorBrush(Color.FromArgb(opacityByte, primaryColor.R, primaryColor.G, primaryColor.B));
                     break;
@@ -175,6 +207,8 @@ public partial class MainWindow
             Resources["HoverBrush"] = new SolidColorBrush(Color.FromRgb(0xD8, 0xD8, 0xD8));
             Resources["InputBorderBrush"] = new SolidColorBrush(Color.FromRgb(0xC0, 0xC0, 0xC0));
             Resources["IconBrush"] = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+            Resources["CardBrushGlass"] = new SolidColorBrush(Color.FromArgb(0xCC, 0xE0, 0xE0, 0xE0));
+            Resources["GlassBorderBrush"] = new SolidColorBrush(Color.FromArgb(0x20, 0x00, 0x00, 0x00));
         }
         else
         {
@@ -182,11 +216,13 @@ public partial class MainWindow
             Resources["TextSecondaryBrush"] = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC));
             Resources["TextTertiaryBrush"] = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
             Resources["TextPlaceholderBrush"] = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
-            Resources["SurfaceBrush"] = new SolidColorBrush(Color.FromRgb(0x15, 0x15, 0x15));
+            Resources["SurfaceBrush"] = new SolidColorBrush(Color.FromRgb(0x0A, 0x0A, 0x0A));
             Resources["CardBrush"] = new SolidColorBrush(Color.FromRgb(0x25, 0x25, 0x25));
             Resources["HoverBrush"] = new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x2A));
             Resources["InputBorderBrush"] = new SolidColorBrush(Color.FromRgb(0x3A, 0x3A, 0x3A));
             Resources["IconBrush"] = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
+            Resources["CardBrushGlass"] = new SolidColorBrush(Color.FromArgb(0xCC, 0x25, 0x25, 0x25));
+            Resources["GlassBorderBrush"] = new SolidColorBrush(Color.FromArgb(0x20, 0xFF, 0xFF, 0xFF));
         }
 
         // Custom overrides
@@ -238,24 +274,7 @@ public partial class MainWindow
 
     private void UpdateCurrentPersonalizationDisplay()
     {
-        var lines = new List<string>
-        {
-            $"Theme: {_appSettings.SelectedTheme}",
-            $"Primary: {_appSettings.PrimaryColor}  Accent: {_appSettings.AccentColor}",
-            $"Border: {_appSettings.BorderColor}  Radius: {_appSettings.BorderRadius}px"
-        };
-        if (!string.IsNullOrEmpty(_appSettings.SecondaryColor)) lines.Add($"Surface: {_appSettings.SecondaryColor}");
-        if (!string.IsNullOrEmpty(_appSettings.TextColor)) lines.Add($"Text: {_appSettings.TextColor}");
-        lines.Add($"Font: {_appSettings.FontFamily} @ {_appSettings.FontSize}pt");
-        lines.Add($"Width: {_appSettings.WindowWidth}  Position: {_appSettings.WindowVerticalPosition}");
-        lines.Add($"Animations: {(_appSettings.AnimationsEnabled ? "On" : "Off")}  Compact: {(_appSettings.CompactMode ? "On" : "Off")}  Bubbles: {_appSettings.ChatBubbleStyle}");
-
-        // Advanced personalization
-        if (_appSettings.BackgroundType != "Solid")
-            lines.Add($"Background: {_appSettings.BackgroundType}  Angle: {_appSettings.GradientAngle}°");
-
-        lines.Add($"Placeholder: \"{_appSettings.CompassBoxDefaultText}\"");
-        CurrentPersonalizationSettings.Text = string.Join("\n", lines);
+        // Debug display removed from UI — method kept for compatibility
     }
 
     private void SyncPersonalizationControls()
@@ -269,7 +288,6 @@ public partial class MainWindow
             FontSizeSlider.Value = _appSettings.FontSize;
             AnimationsCheck.IsChecked = _appSettings.AnimationsEnabled;
             CompactModeCheck.IsChecked = _appSettings.CompactMode;
-            PlaceholderTextInput.Text = _appSettings.CompassBoxDefaultText;
 
             // Font family combo
             FontFamilyCombo.ItemsSource = new[]
@@ -287,7 +305,7 @@ public partial class MainWindow
                 FontFamilyCombo.SelectedIndex = 0;
 
             // Background effects
-            var bgTypes = new[] { "Solid", "LinearGradient", "RadialGradient" };
+            var bgTypes = new[] { "Solid", "LinearGradient", "RadialGradient", "Image" };
             BackgroundTypeCombo.ItemsSource = bgTypes;
             BackgroundTypeCombo.SelectedItem = _appSettings.BackgroundType;
             if (BackgroundTypeCombo.SelectedItem == null) BackgroundTypeCombo.SelectedIndex = 0;
@@ -295,6 +313,35 @@ public partial class MainWindow
             GradientStartInput.Text = _appSettings.GradientStartColor;
             GradientEndInput.Text = _appSettings.GradientEndColor;
             GradientAngleSlider.Value = _appSettings.GradientAngle;
+
+            // Background image controls
+            bool hasImage = !string.IsNullOrEmpty(_appSettings.BackgroundImagePath) && File.Exists(_appSettings.BackgroundImagePath);
+            BackgroundImagePanel.Visibility = _appSettings.BackgroundType == "Image" ? Visibility.Visible : Visibility.Collapsed;
+            RemoveBackgroundImageBtn.Visibility = hasImage ? Visibility.Visible : Visibility.Collapsed;
+            ImageOpacitySlider.Value = _appSettings.BackgroundImageOpacity;
+            if (hasImage)
+            {
+                try
+                {
+                    var thumbBmp = new BitmapImage();
+                    thumbBmp.BeginInit();
+                    thumbBmp.UriSource = new Uri(_appSettings.BackgroundImagePath, UriKind.Absolute);
+                    thumbBmp.CacheOption = BitmapCacheOption.OnLoad;
+                    thumbBmp.DecodePixelWidth = 120;
+                    thumbBmp.EndInit();
+                    thumbBmp.Freeze();
+                    BackgroundImageThumbnail.Source = thumbBmp;
+                    BackgroundImagePreview.Visibility = Visibility.Visible;
+                }
+                catch
+                {
+                    BackgroundImagePreview.Visibility = Visibility.Collapsed;
+                }
+            }
+            else
+            {
+                BackgroundImagePreview.Visibility = Visibility.Collapsed;
+            }
 
             // Window effects
             BorderThicknessSlider.Value = _appSettings.BorderThickness;
@@ -509,6 +556,7 @@ public partial class MainWindow
     {
         if (!IsLoaded || _isSyncingPersonalization || BackgroundTypeCombo.SelectedItem == null) return;
         _appSettings.BackgroundType = BackgroundTypeCombo.SelectedItem.ToString()!;
+        BackgroundImagePanel.Visibility = _appSettings.BackgroundType == "Image" ? Visibility.Visible : Visibility.Collapsed;
         ApplyPersonalizationSettings();
         SaveSettings();
     }
@@ -564,12 +612,7 @@ public partial class MainWindow
 
     private void PlaceholderTextInput_LostFocus(object sender, RoutedEventArgs e)
     {
-        if (!string.IsNullOrWhiteSpace(PlaceholderTextInput.Text))
-        {
-            _appSettings.CompassBoxDefaultText = PlaceholderTextInput.Text.Trim();
-            PlaceholderText.Text = _appSettings.CompassBoxDefaultText;
-            SaveSettings();
-        }
+        // Placeholder text input removed from UI
     }
 
     private async void ResetPersonalization_Click(object sender, RoutedEventArgs e)
@@ -601,16 +644,22 @@ public partial class MainWindow
 
     private void ApplyBuiltInTheme(string themeName)
     {
-        // Reset all advanced settings to defaults first
+        // Reset all advanced/personalization settings to defaults first
         _appSettings.BackgroundType = "Solid";
         _appSettings.GradientStartColor = "";
         _appSettings.GradientEndColor = "";
         _appSettings.GradientAngle = 135.0;
         _appSettings.BorderThickness = 1.0;
+        _appSettings.BackgroundImagePath = "";
+        _appSettings.BackgroundImageOpacity = 0.6;
         _appSettings.SecondaryColor = "";
         _appSettings.TextColor = "";
         _appSettings.CompactMode = false;
         _appSettings.AnimationsEnabled = true;
+        _appSettings.CompassBoxDefaultText = "Ask Gemini or search apps...";
+        _appSettings.FontFamily = "Segoe UI Variable Display, Segoe UI";
+        _appSettings.FontSize = 14;
+        _appSettings.WindowWidth = 700;
 
         switch (themeName)
         {
@@ -641,6 +690,34 @@ public partial class MainWindow
         SyncPersonalizationControls();
     }
 
+    private DispatcherTimer? _spinnerTimer;
+    private int _spinnerFrame;
+    private static readonly string[] _spinnerChars = { "◐", "◓", "◑", "◒" };
+
+    private void ShowGenerationProgress(string status, string sub)
+    {
+        GenerationStatusText.Text = status;
+        GenerationSubText.Text = sub;
+        GenerationProgressPanel.Visibility = Visibility.Visible;
+
+        if (_spinnerTimer == null)
+        {
+            _spinnerTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+            _spinnerTimer.Tick += (s, e) =>
+            {
+                _spinnerFrame = (_spinnerFrame + 1) % _spinnerChars.Length;
+                GenerationSpinner.Text = _spinnerChars[_spinnerFrame];
+            };
+        }
+        _spinnerTimer.Start();
+    }
+
+    private void HideGenerationProgress()
+    {
+        _spinnerTimer?.Stop();
+        GenerationProgressPanel.Visibility = Visibility.Collapsed;
+    }
+
     private async void GeneratePersonalizationPreview_Click(object sender, RoutedEventArgs e)
     {
         if (string.IsNullOrWhiteSpace(PersonalizationInputBox.Text))
@@ -655,7 +732,9 @@ public partial class MainWindow
         }
 
         var btn = sender as Button;
-        if (btn != null) { btn.IsEnabled = false; btn.Content = "Generating..."; }
+        if (btn != null) { btn.IsEnabled = false; btn.Visibility = Visibility.Collapsed; }
+
+        ShowGenerationProgress("Designing your theme...", "AI is crafting colors, layout, and style");
 
         try
         {
@@ -691,12 +770,57 @@ public partial class MainWindow
                  _currentPersonalizationProposal.WindowWidth == null &&
                  _currentPersonalizationProposal.FontFamily == null))
             {
+                HideGenerationProgress();
                 await ShowModernDialog("Invalid Request", "Could not understand your request. Please describe visual changes more clearly.");
                 return;
             }
 
-            BackupCurrentSettings();
-            ApplyProposalTemporarily(_currentPersonalizationProposal);
+            // Generate background image if requested
+            if (!string.IsNullOrEmpty(_currentPersonalizationProposal.BackgroundImagePrompt))
+            {
+                ShowGenerationProgress("Generating background image...", "This may take a moment");
+                try
+                {
+                    var imageResult = await _geminiService.GenerateImageAsync(
+                        _currentPersonalizationProposal.BackgroundImagePrompt,
+                        _appSettings);
+                    if (imageResult.HasValue)
+                    {
+                        ShowGenerationProgress("Applying your new look...", "Almost there");
+                        string savedPath = SaveBackgroundImage(imageResult.Value.data, imageResult.Value.mimeType);
+                        _generatedPreviewImagePath = savedPath;
+                        _currentPersonalizationProposal.BackgroundType = "Image";
+
+                        // Set image path before applying proposal
+                        BackupCurrentSettings();
+                        _appSettings.BackgroundImagePath = savedPath;
+                        ApplyProposalTemporarily(_currentPersonalizationProposal);
+                    }
+                    else
+                    {
+                        // Image gen failed — continue without image, use gradient/solid instead
+                        if (_currentPersonalizationProposal.BackgroundType == "Image")
+                            _currentPersonalizationProposal.BackgroundType = "";
+                        BackupCurrentSettings();
+                        ApplyProposalTemporarily(_currentPersonalizationProposal);
+                    }
+                }
+                catch
+                {
+                    // Image gen failed — continue without image
+                    if (_currentPersonalizationProposal.BackgroundType == "Image")
+                        _currentPersonalizationProposal.BackgroundType = "";
+                    BackupCurrentSettings();
+                    ApplyProposalTemporarily(_currentPersonalizationProposal);
+                }
+            }
+            else
+            {
+                ShowGenerationProgress("Applying your new look...", "Almost there");
+                BackupCurrentSettings();
+                ApplyProposalTemporarily(_currentPersonalizationProposal);
+            }
+
             ShowPersonalizationPreview(_currentPersonalizationProposal);
         }
         catch (Exception ex)
@@ -705,7 +829,8 @@ public partial class MainWindow
         }
         finally
         {
-            if (btn != null) { btn.IsEnabled = true; btn.Content = "Generate & Preview"; }
+            HideGenerationProgress();
+            if (btn != null) { btn.IsEnabled = true; btn.Visibility = Visibility.Visible; }
         }
     }
 
@@ -752,6 +877,10 @@ public partial class MainWindow
             changesList.Add($"• Gradient angle: {proposal.GradientAngle}°");
         if (proposal.BorderThickness.HasValue)
             changesList.Add($"• Border thickness: {proposal.BorderThickness}px");
+        if (!string.IsNullOrEmpty(proposal.BackgroundImagePrompt))
+            changesList.Add("• Background image: AI-generated");
+        if (proposal.BackgroundImageOpacity.HasValue)
+            changesList.Add($"• Image opacity: {proposal.BackgroundImageOpacity:P0}");
 
         PreviewChangesText.Text = string.Join("\n", changesList);
         PreviewSection.Visibility = Visibility.Visible;
@@ -762,6 +891,7 @@ public partial class MainWindow
         if (_currentPersonalizationProposal == null) return;
         SaveSettings();
         _settingsBackup = null;
+        _generatedPreviewImagePath = null; // Keep the file
         PreviewSection.Visibility = Visibility.Collapsed;
         PersonalizationInputBox.Clear();
         _currentPersonalizationProposal = null;
@@ -771,9 +901,102 @@ public partial class MainWindow
 
     private void RejectPersonalization_Click(object sender, RoutedEventArgs e)
     {
+        // Delete the generated preview image if any
+        if (!string.IsNullOrEmpty(_generatedPreviewImagePath))
+        {
+            try { File.Delete(_generatedPreviewImagePath); } catch { }
+            _generatedPreviewImagePath = null;
+        }
         RestoreSettingsBackup();
         PreviewSection.Visibility = Visibility.Collapsed;
         _currentPersonalizationProposal = null;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Background image helpers
+    // ---------------------------------------------------------------------------
+
+    private string SaveBackgroundImage(byte[] data, string mimeType)
+    {
+        string ext = mimeType switch
+        {
+            "image/jpeg" => ".jpg",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            _ => ".png"
+        };
+        string folder = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Compass", "Backgrounds");
+        Directory.CreateDirectory(folder);
+        string fileName = $"bg_{DateTime.Now:yyyyMMdd_HHmmss}{ext}";
+        string filePath = Path.Combine(folder, fileName);
+        File.WriteAllBytes(filePath, data);
+        return filePath;
+    }
+
+    private void PickBackgroundImage_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Filter = "Image files|*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp|All files|*.*",
+            Title = "Pick Background Image"
+        };
+
+        _isFileDialogOpen = true;
+        try
+        {
+            if (dlg.ShowDialog() == true)
+            {
+                // Copy to Backgrounds folder
+                byte[] data = File.ReadAllBytes(dlg.FileName);
+                string mime = GetMimeType(dlg.FileName);
+                string savedPath = SaveBackgroundImage(data, mime);
+
+                _appSettings.BackgroundImagePath = savedPath;
+                _appSettings.BackgroundType = "Image";
+                ApplyPersonalizationSettings();
+                SyncPersonalizationControls();
+                SaveSettings();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to pick background image");
+        }
+        finally
+        {
+            _isFileDialogOpen = false;
+        }
+    }
+
+    private void RemoveBackgroundImage_Click(object sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrEmpty(_appSettings.BackgroundImagePath))
+        {
+            try { File.Delete(_appSettings.BackgroundImagePath); } catch { }
+        }
+        _appSettings.BackgroundImagePath = "";
+        _appSettings.BackgroundType = "Solid";
+        ApplyPersonalizationSettings();
+        SyncPersonalizationControls();
+        SaveSettings();
+    }
+
+    private DispatcherTimer? _imageOpacitySaveTimer;
+    private void ImageOpacitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (!IsLoaded || _isSyncingPersonalization) return;
+        _appSettings.BackgroundImageOpacity = Math.Round(ImageOpacitySlider.Value, 2);
+        ApplyPersonalizationSettings();
+
+        if (_imageOpacitySaveTimer == null)
+        {
+            _imageOpacitySaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
+            _imageOpacitySaveTimer.Tick += (s, a) => { _imageOpacitySaveTimer.Stop(); SaveSettings(); };
+        }
+        _imageOpacitySaveTimer.Stop();
+        _imageOpacitySaveTimer.Start();
     }
 
 }

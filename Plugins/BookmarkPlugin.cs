@@ -1,16 +1,19 @@
 using System.Diagnostics;
 using System.Windows.Media;
 using Compass.Services;
+using Microsoft.Extensions.Logging;
 
 namespace Compass.Plugins;
 
 public class BookmarkPlugin : ICompassPlugin
 {
     private readonly BookmarkService _bookmarkService;
+    private readonly ILogger<BookmarkPlugin> _logger;
 
-    public BookmarkPlugin(BookmarkService bookmarkService)
+    public BookmarkPlugin(BookmarkService bookmarkService, ILogger<BookmarkPlugin> logger)
     {
         _bookmarkService = bookmarkService;
+        _logger = logger;
     }
 
     public string Name => "Browser Bookmarks";
@@ -47,7 +50,7 @@ public class BookmarkPlugin : ICompassPlugin
                 Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
                 return Task.FromResult<string?>("Opened bookmark");
             }
-            catch (Exception ex) { Serilog.Log.Warning(ex, "Failed to open bookmark"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to open bookmark: {Url}", url); }
         }
         return Task.FromResult<string?>(null);
     }
